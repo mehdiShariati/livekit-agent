@@ -1,0 +1,12 @@
+# Core LiveKit packages
+livekit-agents[simli]>=1.2.0
+
+# LiveKit plugins
+livekit-plugins-openai>=1.0.0
+livekit-plugins-deepgram>=1.0.0
+livekit-plugins-silero>=1.0.0
+livekit-plugins-turn-detector>=1.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
