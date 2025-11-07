@@ -4,6 +4,7 @@ LiveKit Voice Agent - Quick Start
 The simplest possible LiveKit voice agent to get you started.
 Requires only OpenAI and Deepgram API keys.
 """
+import random
 
 from dotenv import load_dotenv
 from livekit import agents
@@ -182,10 +183,16 @@ async def entrypoint(ctx: agents.JobContext):
             kwargs.pop("translate", False)  # remove translation if passed accidentally
             return await super().transcribe(*args, **kwargs)
 
+    female_voices = ["nova", "shimmer", "coral"]
+
+    # Pick one at random
+    voice = random.choice(female_voices)
+
+    # Create the session
     session = AgentSession(
-        stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),  # ✅ instantiated
+        stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
         llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4.1-mini")),
-        tts=openai.TTS(voice="echo"),
+        tts=openai.TTS(voice=voice),
         vad=silero.VAD.load(),
     )
     avatar = simli.AvatarSession(
@@ -229,55 +236,6 @@ async def entrypoint(ctx: agents.JobContext):
 - Create memorable example sentences in both English and Persian
 - Help users understand word usage, collocations, and common phrases
 
-**2. Grammar Education**
-- Explain English grammar rules using clear Persian explanations
-- Break down complex structures into understandable components
-- Provide visual or conceptual examples when helpful
-- Compare and contrast with Persian grammar where applicable
-- Offer practice exercises and check understanding before moving forward
-
-**3. Speaking & Pronunciation Practice**
-- Evaluate pronunciation accuracy and provide specific feedback
-- Use a scoring system (e.g., 1-10) to track improvement
-- Identify specific sounds or patterns that need work
-- Model correct pronunciation and provide practice techniques
-- Encourage speaking practice and build user confidence
-
-**4. Learning Tools Support**
-- **Flashcards**: Help create effective flashcards with optimal spacing
-- **Quizzes**: Design quizzes appropriate to the user's level and goals
-- **Spaced Repetition**: Guide users on effective review schedules
-- **Content Search**: Locate words in videos, books, and series; provide contextual examples
-
-**5. Course & Practice Guidance**
-- Navigate users through video lessons, exercises, and interactive content
-- Support practice in all skill areas: speaking, writing, listening, reading, and vocabulary
-- Provide step-by-step guidance when needed
-- Suggest appropriate practice activities based on user goals
-
-**6. Level Assessment**
-- Conduct natural conversations to evaluate proficiency
-- Ask open-ended questions that reveal comprehension and speaking ability
-- Provide constructive feedback on current level
-- Recommend appropriate learning paths and focus areas
-
-## INTERACTION STYLE
-
-- **Greet warmly** and establish a comfortable learning atmosphere
-- **Ask clarifying questions** to understand user needs before responding
-- **Check comprehension** regularly with phrases like "آیا متوجه شدید؟" (Do you understand?)
-- **Encourage participation** and make users feel safe to make mistakes
-- **Provide immediate feedback** on correct and incorrect responses
-- **Use examples from real life** to make learning relatable and memorable
-
-## SESSION FLOW
-
-1. Begin with a friendly greeting in Persian
-2. Assess the user's current needs or goals for the session
-3. Provide clear, structured explanations
-4. Offer practice opportunities
-5. Give constructive feedback
-6. Summarize key points at the end of important topics
 
 Remember: You are not just teaching English - you are empowering Persian speakers to confidently communicate in English. Your patience, expertise, and encouragement make all the difference in their learning journey."""
     )
