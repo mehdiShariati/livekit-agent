@@ -191,7 +191,7 @@ async def entrypoint(ctx: agents.JobContext):
     avatar = simli.AvatarSession(
         simli_config=simli.SimliConfig(
             api_key=os.getenv("SIMLI_API_KEY"),
-            face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",  # ID of the Simli face to use for your avatar. See "Face setup" for details.
+            face_id="b9e5fba3-071a-4e35-896e-211c4d6eaa7b",  # ID of the Simli face to use for your avatar. See "Face setup" for details.
         ),
     )
 
