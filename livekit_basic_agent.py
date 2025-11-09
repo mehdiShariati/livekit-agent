@@ -56,41 +56,43 @@ async def entrypoint(ctx: agents.JobContext):
     """Entry point for the agent."""
 
     # Get the agent type from job metadata (set by Django backend)
-    agent_type = ctx.job.metadata.get("agent_type", "tutor")
-    config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
+    agent_type = ctx.job.metadata
+    if agent_type:
+        agent_type = agent_type.get("agent_type", "tutor")
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
 
-    # Pick a random voice
-    voice = random.choice(config["voice_choices"])
+        # Pick a random voice
+        voice = random.choice(config["voice_choices"])
 
-    # Custom STT to force transcription (not translation)
-    class CustomWhisperSTT(openai.STT):
-        async def transcribe(self, *args, **kwargs):
-            kwargs["task"] = "transcribe"
-            kwargs.pop("translate", False)
-            return await super().transcribe(*args, **kwargs)
+        # Custom STT to force transcription (not translation)
+        class CustomWhisperSTT(openai.STT):
+            async def transcribe(self, *args, **kwargs):
+                kwargs["task"] = "transcribe"
+                kwargs.pop("translate", False)
+                return await super().transcribe(*args, **kwargs)
 
-    # Setup session with components
-    session = AgentSession(
-        stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
-        llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4.1-mini")),
-        tts=openai.TTS(voice=voice),
-        vad=silero.VAD.load(),
-    )
+        # Setup session with components
+        session = AgentSession(
+            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
+            llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4.1-mini")),
+            tts=openai.TTS(voice=voice),
+            vad=silero.VAD.load(),
+        )
 
-    avatar = simli.AvatarSession(
-        simli_config=simli.SimliConfig(
-            api_key=os.getenv("SIMLI_API_KEY"),
-            face_id=os.getenv("SIMLI_FACE_ID", "cace3ef7-a4c4-425d-a8cf-a5358eb0c427"),
-        ),
-    )
+        avatar = simli.AvatarSession(
+            simli_config=simli.SimliConfig(
+                api_key=os.getenv("SIMLI_API_KEY"),
+                face_id=os.getenv("SIMLI_FACE_ID", "cace3ef7-a4c4-425d-a8cf-a5358eb0c427"),
+            ),
+        )
 
-    await avatar.start(session, room=ctx.room)
+        await avatar.start(session, room=ctx.room)
 
-    # Start the session
-    await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
+        # Start the session
+        await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
 
-    # Optional initial message
-    await session.generate_reply(instructions=f"شروع گفتگو: نوع عامل شما: {agent_type}")
+        # Optional initial message
+        await session.generate_reply(instructions=f"شروع گفتگو: نوع عامل شما: {agent_type}")
 
 
 if __name__ == "__main__":
