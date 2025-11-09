@@ -14,11 +14,11 @@ load_dotenv(".env")
 AGENT_TYPES = {
     "onboarding": {
         "instructions": """
-        You are a friendly onboarding guide who helps new users understand how to use the Zabano platform.
-        Speak in Persian and use simple English examples when relevant.
+        You are a friendly onboarding guide who helps new users understand how to use the zabano.com platform.
+        Speak in Persian .
         Keep responses short, warm, and motivating.
         """,
-        "voice_choices": ["nova", "shimmer"],
+        "voice_choices": ["nova"],
     },
     "assessment": {
         "instructions": """
