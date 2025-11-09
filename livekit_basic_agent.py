@@ -57,8 +57,10 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Get the agent type from job metadata (set by Django backend)
     agent_type = ctx.job.metadata
-    print(ctx.job.metadata)
+    print(f"metadata agent name is is {ctx.job.agent_name}")
+    print(f"metadata is  {ctx.job.metadata}")
     if agent_type:
+        pass
         agent_type = agent_type.get("agent_type", "tutor")
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
 
