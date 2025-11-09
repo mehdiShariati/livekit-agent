@@ -23,10 +23,12 @@ class JobRequest(BaseModel):
     room_name: str
     agent_type: str = "tutor"  # default
 
+
 @app.on_event("startup")
 async def startup_event():
-    # Start the LiveKit worker in background
+    """Start LiveKit worker in background"""
     asyncio.create_task(worker.run())
+
 
 @app.post("/jobs")
 async def create_job(request: JobRequest):
@@ -34,9 +36,10 @@ async def create_job(request: JobRequest):
     try:
         metadata = {"agent_type": request.agent_type}
 
-        await worker.create_job(
-            metadata=metadata,
+        # ✅ FIX: use submit_job() instead of create_job()
+        await worker.submit_job(
             room=request.room_name,
+            metadata=metadata,
         )
 
         return {
