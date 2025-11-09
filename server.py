@@ -55,7 +55,6 @@ async def create_job(request: JobRequest):
             "status": "started",
             "agent_type": request.agent_type,
             "room": request.room_name,
-            "dispatch_id": dispatch.dispatch_id,
         }
 
     except Exception as e:
