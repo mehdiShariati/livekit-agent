@@ -45,10 +45,9 @@ async def create_job(request: JobRequest):
             api.CreateAgentDispatchRequest(
                 agent_name=request.agent_type,  # must match your AgentTemplate key/agent_name
                 room=request.room_name,
-                metadata="salam",
+                metadata="salam chetori?",
             )
         )
-
         await lkapi.aclose()
 
         return {
