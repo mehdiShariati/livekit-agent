@@ -59,7 +59,7 @@ async def entrypoint(ctx: agents.JobContext):
     agent_type = ctx.job.metadata
     print(f"metadata agent name is is {ctx.job.agent_name}")
     print(f"metadata is  {ctx.job.metadata}")
-    print(f"metadata api is  {ctx.api}")
+    print(f"metadata api is  {ctx.api.agent_dispatch.__dict__}")
     if agent_type:
         pass
         agent_type = agent_type.get("agent_type", "tutor")
