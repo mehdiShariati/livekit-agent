@@ -1,6 +1,7 @@
 import json
 import random
 import os
+import asyncio
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -86,17 +87,24 @@ async def entrypoint(ctx: agents.JobContext):
     if instruction:
         behavior = instruction.get('behavior')
 
-    # Check if there are already agents in the room
+    # Connect to room
     await ctx.connect()
 
-    # Get all participants in the room
-    participants = ctx.room.remote_participants
+    # Wait a bit for other agents to appear (handle race condition)
+    await asyncio.sleep(0.5)
 
-    # Check if there's already an agent in the room
+    # Check if there are already agents in the room
+    participants = ctx.room.remote_participants
+    agent_count = 0
+
     for participant in participants.values():
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
-            print(f"⚠️ Agent already exists in room {ctx.room.name}, skipping")
-            return
+            agent_count += 1
+            print(f"⚠️ Found existing agent in room: {participant.identity}")
+
+    if agent_count > 0:
+        print(f"⚠️ {agent_count} agent(s) already in room {ctx.room.name}, skipping")
+        return
 
     print(f"✅ No existing agent found, proceeding to start {agent_type} agent")
 
@@ -109,12 +117,11 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Custom STT to force transcription (not translation)
         class CustomWhisperSTT(openai.STT):
-            class CustomWhisperSTT(openai.STT):
-                async def transcribe(self, *args, **kwargs):
-                    # Force Whisper to transcribe (not translate)
-                    kwargs["task"] = "transcribe"  # 👈 critical flag
-                    kwargs.pop("translate", False)  # remove translation if passed accidentally
-                    return await super().transcribe(*args, **kwargs)
+            async def transcribe(self, *args, **kwargs):
+                # Force Whisper to transcribe (not translate)
+                kwargs["task"] = "transcribe"  # 👈 critical flag
+                kwargs.pop("translate", False)  # remove translation if passed accidentally
+                return await super().transcribe(*args, **kwargs)
 
         # Setup session components
         session = AgentSession(
@@ -130,7 +137,7 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Send greeting
         if behavior:
-            greeting = json.dumps(behavior)
+            greeting = behavior  # Don't stringify it, use it directly
         await session.generate_reply(instructions=greeting)
 
         print(f"✅ {agent_type} agent started successfully")
