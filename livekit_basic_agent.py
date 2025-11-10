@@ -86,8 +86,6 @@ async def entrypoint(ctx: agents.JobContext):
     instruction = metadata.get('config')
     behavior = ""
     if instruction:
-        instruction = instruction.get('livekit')
-        print(f"inst is {instruction}")
         behavior = instruction.get('behavior')
     print(f"behavior is {behavior}")
     # Prevent duplicate sessions
