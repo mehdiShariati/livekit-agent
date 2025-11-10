@@ -68,6 +68,7 @@ async def entrypoint(ctx: agents.JobContext):
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
+            print(metadata)
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
