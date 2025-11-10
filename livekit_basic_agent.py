@@ -57,16 +57,21 @@ class DynamicAssistant(Agent):
 async def entrypoint(ctx: agents.JobContext):
     """Entry point for the agent."""
     metadata = {}
-    if ctx.job and ctx.job.metadata:
-        try:
-            metadata = json.loads(ctx.job.metadata)
-        except Exception:
-            pass
 
-    # 🔒 Safety: only handle jobs created by your FastAPI endpoint
+    # Try both possible sources
+    raw_meta = getattr(ctx.job, "metadata", None) or getattr(ctx.dispatch, "metadata", None)
+    if raw_meta:
+        try:
+            metadata = json.loads(raw_meta)
+        except Exception as e:
+            print("❌ Metadata parse error:", e, "Raw:", raw_meta)
+
+    print("🧩 Received metadata:", metadata)
+
+    # Skip unrelated dispatches
     if metadata.get("source") != "zabano":
         print("⚠️ Ignoring unrelated dispatch:", metadata)
-        return  # ignore system/auto dispatches
+        return
 
     agent_type = metadata.get("agent_type") or ctx.room.name.split("-")[-1]
     config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
