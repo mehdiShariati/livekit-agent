@@ -109,17 +109,16 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Custom STT to force transcription (not translation)
         class CustomWhisperSTT(openai.STT):
-            async def _recognize_impl(self, buffer, *, language=None):
-                """Override to force transcription mode."""
-                return await super()._recognize_impl(
-                    buffer,
-                    language=language,
-                    prompt="transcribe"
-                )
+            class CustomWhisperSTT(openai.STT):
+                async def transcribe(self, *args, **kwargs):
+                    # Force Whisper to transcribe (not translate)
+                    kwargs["task"] = "transcribe"  # 👈 critical flag
+                    kwargs.pop("translate", False)  # remove translation if passed accidentally
+                    return await super().transcribe(*args, **kwargs)
 
         # Setup session components
         session = AgentSession(
-            stt=CustomWhisperSTT(model="whisper-1"),
+            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
             llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
             tts=openai.TTS(voice=voice),
             vad=silero.VAD.load(),
