@@ -26,7 +26,7 @@ worker = agents.Worker(
 class JobRequest(BaseModel):
     room_name: str
     agent_type: str = "tutor"
-    config_schema:str
+    config_schema:dict
 
 
 @app.on_event("startup")
