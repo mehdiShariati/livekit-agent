@@ -96,7 +96,7 @@ async def entrypoint(ctx: agents.JobContext):
     # Check if there are already agents in the room
     participants = ctx.room.remote_participants
     agent_count = 0
-
+    print(participants)
     for participant in participants.values():
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
             agent_count += 1
