@@ -26,7 +26,7 @@ worker = agents.Worker(
 class JobRequest(BaseModel):
     room_name: str
     agent_type: str = "tutor"
-    config_schema: list
+    config: dict
 
 
 @app.on_event("startup")
@@ -44,7 +44,8 @@ async def create_job(request: JobRequest):
         )
         metadata = {
             "agent_type": request.agent_type,
-            "source": "zabano"
+            "source": "zabano",
+            "config": request.config
         }
         js  =json.dumps(metadata)
         print(request)
