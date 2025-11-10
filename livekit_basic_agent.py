@@ -5,7 +5,7 @@ import asyncio
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
-from livekit.plugins import openai, silero
+from livekit.plugins import openai, silero, simli
 
 # Load environment variables
 load_dotenv(".env")
@@ -130,6 +130,17 @@ async def entrypoint(ctx: agents.JobContext):
             tts=openai.TTS(voice=voice),
             vad=silero.VAD.load(),
         )
+
+        avatar = simli.AvatarSession(
+            simli_config=simli.SimliConfig(
+                api_key=os.getenv("SIMLI_API_KEY"),
+                face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",
+                # ID of the Simli face to use for your avatar. See "Face setup" for details.
+            ),
+        )
+
+        # Start the avatar and wait for it to join
+        await avatar.start(session, room=ctx.room)
 
         # Start the session
         await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
