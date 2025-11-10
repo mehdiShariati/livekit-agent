@@ -2,7 +2,7 @@ import json
 import random
 import os
 from dotenv import load_dotenv
-from livekit import agents
+from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero
 
@@ -94,7 +94,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Check if there's already an agent in the room
     for participant in participants.values():
-        if participant.kind == agents.ParticipantKind.AGENT:
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
             print(f"⚠️ Agent already exists in room {ctx.room.name}, skipping")
             return
 
