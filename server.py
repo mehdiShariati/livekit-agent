@@ -42,16 +42,17 @@ async def create_job(request: JobRequest):
             api_key=os.getenv("LIVEKIT_API_KEY"),
             api_secret=os.getenv("LIVEKIT_API_SECRET"),
         )
+        metadata = {
+            "agent_type": request.agent_type,
+            "config": request.config_schema,  # already a dict
+            "source": "zabano"
+        }
 
         dispatch = await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
                 agent_name="zabano_agent",  # Match worker agent_name
                 room=request.room_name,
-                metadata=json.dumps({
-                    "agent_type": request.agent_type,
-                    'config': request.config_schema,
-                    "source": "zabano"
-                })
+                metadata=json.dumps(metadata)
             )
         )
         await lkapi.aclose()
