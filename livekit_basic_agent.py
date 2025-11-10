@@ -55,11 +55,9 @@ class DynamicAssistant(Agent):
 # 🚀 Entrypoint
 # ---------------------------------------------
 async def entrypoint(ctx: agents.JobContext):
-    """Entry point for the agent."""
     metadata = {}
 
-    # Try both possible sources
-    raw_meta = getattr(ctx.job, "metadata", None) or getattr(ctx.dispatch, "metadata", None)
+    raw_meta = getattr(ctx.job, "metadata", None)
     if raw_meta:
         try:
             metadata = json.loads(raw_meta)
@@ -68,7 +66,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     print("🧩 Received metadata:", metadata)
 
-    # Skip unrelated dispatches
+    # Ignore any automatic LiveKit system jobs
     if metadata.get("source") != "zabano":
         print("⚠️ Ignoring unrelated dispatch:", metadata)
         return
