@@ -43,9 +43,6 @@ AGENT_TYPES = {
     },
 }
 
-# Track active sessions to prevent duplicates
-active_sessions = set()
-
 
 # ---------------------------------------------
 # 👩‍🏫 Dynamic Assistant class
@@ -68,7 +65,7 @@ async def entrypoint(ctx: agents.JobContext):
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
-            print(metadata)
+            print(f"📦 Metadata: {metadata}")
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
@@ -83,18 +80,25 @@ async def entrypoint(ctx: agents.JobContext):
             return
     else:
         agent_type = metadata.get("agent_type", "tutor")
+
     instruction = metadata.get('config')
     behavior = ""
     if instruction:
         behavior = instruction.get('behavior')
-    print(f"behavior is {behavior}")
-    # Prevent duplicate sessions
-    session_key = f"{ctx.room.name}_{agent_type}"
-    if session_key in active_sessions:
-        print(f"⚠️ Session already active: {session_key}")
-        return
 
-    active_sessions.add(session_key)
+    # Check if there are already agents in the room
+    await ctx.connect()
+
+    # Get all participants in the room
+    participants = ctx.room.remote_participants
+
+    # Check if there's already an agent in the room
+    for participant in participants.values():
+        if participant.kind == agents.ParticipantKind.AGENT:
+            print(f"⚠️ Agent already exists in room {ctx.room.name}, skipping")
+            return
+
+    print(f"✅ No existing agent found, proceeding to start {agent_type} agent")
 
     try:
         # Get configuration
@@ -137,9 +141,6 @@ async def entrypoint(ctx: agents.JobContext):
         import traceback
         traceback.print_exc()
         raise
-    finally:
-        # Clean up session tracking
-        active_sessions.discard(session_key)
 
 
 if __name__ == "__main__":
