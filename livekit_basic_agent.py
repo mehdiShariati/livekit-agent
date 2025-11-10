@@ -83,7 +83,11 @@ async def entrypoint(ctx: agents.JobContext):
             return
     else:
         agent_type = metadata.get("agent_type", "tutor")
-
+    instruction = metadata.get('livekit')
+    behavior = ""
+    if instruction:
+        behavior = instruction.get('behavior')
+    print(f"behavior is {behavior}")
     # Prevent duplicate sessions
     session_key = f"{ctx.room.name}_{agent_type}"
     if session_key in active_sessions:
@@ -119,9 +123,11 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Start the session
         await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
+        greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
 
         # Send greeting
-        greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
+        if behavior:
+            greeting = json.dumps(behavior)
         await session.generate_reply(instructions=greeting)
 
         print(f"✅ {agent_type} agent started successfully")
