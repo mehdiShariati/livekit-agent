@@ -1,3 +1,4 @@
+import json
 import random
 import os
 from dotenv import load_dotenv
@@ -55,9 +56,19 @@ class DynamicAssistant(Agent):
 # ---------------------------------------------
 async def entrypoint(ctx: agents.JobContext):
     """Entry point for the agent."""
+    metadata = {}
+    if ctx.job and ctx.job.metadata:
+        try:
+            metadata = json.loads(ctx.job.metadata)
+        except Exception:
+            pass
 
-    # Get the agent type from job metadata (set by Django backend)
-    agent_type = ctx.room.name.split("-")[-1]
+    # 🔒 Safety: only handle jobs created by your FastAPI endpoint
+    if metadata.get("source") != "zabano":
+        print("⚠️ Ignoring unrelated dispatch:", metadata)
+        return  # ignore system/auto dispatches
+
+    agent_type = metadata.get("agent_type") or ctx.room.name.split("-")[-1]
     config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
     if config:
     # Pick a random voice
