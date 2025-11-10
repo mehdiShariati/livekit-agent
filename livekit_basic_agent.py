@@ -137,7 +137,8 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Send greeting
         if behavior:
-            greeting = behavior  # Don't stringify it, use it directly
+            greeting = json.dumps(behavior)  # Don't stringify it, use it directly
+
         await session.generate_reply(instructions=greeting)
 
         print(f"✅ {agent_type} agent started successfully")
