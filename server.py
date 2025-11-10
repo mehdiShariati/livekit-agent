@@ -1,27 +1,30 @@
 import json
 import os
 import asyncio
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from livekit import api  # server SDK for dispatch
-from livekit import agents  # worker side (unchanged)
+from livekit import api, agents
 
-from livekit_basic_agent import entrypoint  # import your dynamic entrypoint
+from livekit_basic_agent import entrypoint
+
+load_dotenv(".env")
 
 app = FastAPI(title="LiveKit Agent Manager")
 
-# Initialize the worker (this runs the agent code)
 worker = agents.Worker(
     agents.WorkerOptions(
         entrypoint_fnc=entrypoint,
-        # optionally set agent_name if you want explicit agent names
-        # agent_name="onboarding_agent"
+        agent_name="zabano_agent",
+        ws_url=os.getenv("LIVEKIT_URL"),
+        api_key=os.getenv("LIVEKIT_API_KEY"),
+        api_secret=os.getenv("LIVEKIT_API_SECRET"),
     )
 )
 
 class JobRequest(BaseModel):
     room_name: str
-    agent_type: str = "tutor"  # default
+    agent_type: str = "tutor"
 
 @app.on_event("startup")
 async def startup_event():
@@ -29,21 +32,16 @@ async def startup_event():
 
 @app.post("/jobs")
 async def create_job(request: JobRequest):
-    """Spawn a new agent in a specific room."""
     try:
-        # Create a dispatch via LiveKit server
         lkapi = api.LiveKitAPI(
             url=os.getenv("LIVEKIT_URL"),
             api_key=os.getenv("LIVEKIT_API_KEY"),
             api_secret=os.getenv("LIVEKIT_API_SECRET"),
         )
 
-        # metadata can be JSON string
-        metadata = {"agent_type": request.agent_type}
-
         dispatch = await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
-                agent_name=request.agent_type,
+                agent_name="zabano_agent",  # Match worker agent_name
                 room=request.room_name,
                 metadata=json.dumps({
                     "agent_type": request.agent_type,
@@ -57,8 +55,9 @@ async def create_job(request: JobRequest):
             "status": "started",
             "agent_type": request.agent_type,
             "room": request.room_name,
+            "dispatch_id": dispatch.id
         }
 
     except Exception as e:
-        # optionally log e
+        print(f"❌ Dispatch error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
