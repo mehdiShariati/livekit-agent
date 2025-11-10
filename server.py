@@ -22,13 +22,16 @@ worker = agents.Worker(
     )
 )
 
+
 class JobRequest(BaseModel):
     room_name: str
     agent_type: str = "tutor"
 
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(worker.run())
+
 
 @app.post("/jobs")
 async def create_job(request: JobRequest):
@@ -45,6 +48,7 @@ async def create_job(request: JobRequest):
                 room=request.room_name,
                 metadata=json.dumps({
                     "agent_type": request.agent_type,
+                    'config': request.config_schema,
                     "source": "zabano"
                 })
             )
