@@ -47,12 +47,13 @@ async def create_job(request: JobRequest):
             "config": request.config_schema,  # already a dict
             "source": "zabano"
         }
-
+        js  =json.dumps(metadata)
+        print(js)
         dispatch = await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
                 agent_name="zabano_agent",  # Match worker agent_name
                 room=request.room_name,
-                metadata=json.dumps(metadata)
+                metadata=""
             )
         )
         await lkapi.aclose()
