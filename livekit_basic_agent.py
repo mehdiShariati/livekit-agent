@@ -11,11 +11,11 @@ from livekit.plugins import openai, silero, simli
 # Load environment variables
 load_dotenv(".env")
 
-DJANGO_URL = os.getenv("DJANGO_API_BASE", "https://your-django.com")  # Update to your Django server
+# ----------------------------
+# Configuration
+# ----------------------------
+DJANGO_URL = os.getenv("DJANGO_API_BASE", "https://your-django.com")  # Your Django API base
 
-# ---------------------------------------------
-# 🧱 Agent Template Configuration
-# ---------------------------------------------
 AGENT_TYPES = {
     "onboarding": {
         "instructions": """
@@ -46,34 +46,30 @@ AGENT_TYPES = {
     },
 }
 
-# ---------------------------------------------
-# 👩‍🏫 Dynamic Assistant class
-# ---------------------------------------------
+# ----------------------------
+# Dynamic Assistant
+# ----------------------------
 class DynamicAssistant(Agent):
     def __init__(self, agent_type="tutor"):
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
         super().__init__(instructions=config["instructions"])
         self.agent_type = agent_type
 
-# ---------------------------------------------
-# 🔌 Helper to send events to Django
-# ---------------------------------------------
+# ----------------------------
+# Helper: Send events to Django
+# ----------------------------
 async def send_to_django(path, payload):
-    print(payload)
-    print("-----------------------------")
-    # url = f"{DJANGO_URL}{path}"
-    # async with aiohttp.ClientSession() as session:
-    #     try:
-    #         await session.post(url, json=payload)
-    #     except Exception as e:
-    #         print(f"❌ Failed sending to Django: {e}")
+    url = f"{DJANGO_URL}{path}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            await session.post(url, json=payload)
+        except Exception as e:
+            print(f"❌ Failed sending to Django: {e}")
 
-# ---------------------------------------------
-# 🚀 Entrypoint
-# ---------------------------------------------
+# ----------------------------
+# Entrypoint
+# ----------------------------
 async def entrypoint(ctx: agents.JobContext):
-    """Main entrypoint for the LiveKit agent."""
-
     # --- Parse metadata ---
     metadata = {}
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
@@ -83,6 +79,7 @@ async def entrypoint(ctx: agents.JobContext):
             print(f"❌ Failed to parse metadata: {e}")
 
     if metadata.get("source") != "zabano":
+        print("⚠️ Not a zabano job, skipping")
         return
 
     agent_type = metadata.get("agent_type", "tutor")
@@ -90,7 +87,7 @@ async def entrypoint(ctx: agents.JobContext):
 
     # --- Connect to room ---
     await ctx.connect()
-    await asyncio.sleep(0.5)  # wait for other agents
+    await asyncio.sleep(0.5)
 
     # Prevent multiple agents
     for p in ctx.room.remote_participants.values():
@@ -119,109 +116,112 @@ async def entrypoint(ctx: agents.JobContext):
     room_name = ctx.room.name
 
     # --- Register agent instance in Django ---
-    await send_to_django("/agent-instance/create/", {
+    asyncio.create_task(send_to_django("/agent-instance/create/", {
         "dispatch_id": agent_id,
         "room_name": room_name,
         "agent_type": agent_type,
-    })
+    }))
 
-    # ---------------------------------------------
-    # ✅ All important AgentSession events
-    # ---------------------------------------------
+    # ----------------------------
+    # AgentSession event handlers
+    # ----------------------------
     @session.on("assistant_message")
-    async def on_ai_message(ev):
-        ai_text = ev.text or ""
-        print(f"🤖 AI: {ai_text}")
-        await send_to_django("/livekit/agent-event/", {
+    def on_ai_message(ev):
+        print(f"🤖 AI: {ev.text}")
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "assistant_message",
-            "text": ai_text
-        })
+            "text": ev.text
+        }))
 
     @session.on("user_message")
-    async def on_user_message(ev):
-        text = ev.text or ""
-        print(f"🧑 User: {text}")
-        await send_to_django("/livekit/agent-event/", {
+    def on_user_message(ev):
+        print(f"🧑 User: {ev.text}")
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "user_message",
-            "text": text
-        })
+            "text": ev.text
+        }))
 
     @session.on("transcription")
-    async def on_transcription(ev):
+    def on_transcription(ev):
         print(f"📝 Transcription chunk: {ev.text}")
-        await send_to_django("/livekit/agent-event/", {
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "transcription",
             "text": ev.text
-        })
+        }))
 
     @session.on("session_started")
-    async def on_session_started(ev):
+    def on_session_started(ev):
         print("🚀 Session started")
-        await send_to_django("/livekit/agent-event/", {
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "agent_started"
-        })
+        }))
 
     @session.on("session_ended")
-    async def on_session_ended(ev):
+    def on_session_ended(ev):
         print("🛑 Session ended")
-        await send_to_django("/livekit/agent-event/", {
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "agent_finished"
-        })
+        }))
 
     @session.on("participant_joined")
-    async def on_participant_joined(ev):
+    def on_participant_joined(ev):
         print(f"➕ Participant joined: {ev.participant.identity}")
-        await send_to_django("/livekit/agent-event/", {
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "participant_joined",
             "participant": ev.participant.identity
-        })
+        }))
 
     @session.on("participant_left")
-    async def on_participant_left(ev):
+    def on_participant_left(ev):
         print(f"➖ Participant left: {ev.participant.identity}")
-        await send_to_django("/livekit/agent-event/", {
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "participant_left",
             "participant": ev.participant.identity
-        })
+        }))
 
     @session.on("error")
-    async def on_error(ev):
+    def on_error(ev):
         print(f"❌ Session error: {ev}")
-        await send_to_django("/livekit/agent-event/", {
+        asyncio.create_task(send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "error",
             "payload": str(ev)
-        })
+        }))
 
-    # ---------------------------------------------
-    # Optional Simli Avatar Events (if used)
-    # ---------------------------------------------
-    # avatar = simli.AvatarSession(simli.SimliConfig(api_key=os.getenv("SIMLI_API_KEY"), face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6"))
+    # ----------------------------
+    # Optional Simli Avatar Events
+    # ----------------------------
+    # avatar = simli.AvatarSession(
+    #     simli_config=simli.SimliConfig(
+    #         api_key=os.getenv("SIMLI_API_KEY"),
+    #         face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6"
+    #     )
+    # )
     # await avatar.start(session, room=ctx.room)
     # @avatar.on("avatar_state_changed")
-    # async def on_avatar_state(ev):
+    # def on_avatar_state(ev):
     #     print(f"🎭 Avatar event: {ev}")
-    #     await send_to_django("/livekit/agent-event/", {
+    #     asyncio.create_task(send_to_django("/livekit/agent-event/", {
     #         "room": room_name,
     #         "agent_id": agent_id,
     #         "type": "avatar_event",
     #         "payload": str(ev)
-    #     })
+    #     }))
 
     # --- Start session and send greeting ---
     await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
@@ -230,8 +230,8 @@ async def entrypoint(ctx: agents.JobContext):
 
     print(f"✅ {agent_type} agent started successfully in room {room_name}")
 
-# ---------------------------------------------
-# CLI entry
-# ---------------------------------------------
+# ----------------------------
+# CLI Entry
+# ----------------------------
 if __name__ == "__main__":
     agents.cli.run_app(entrypoint)
