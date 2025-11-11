@@ -60,7 +60,7 @@ async def entrypoint(ctx: agents.JobContext):
     agent_type = metadata.get("agent_type", "tutor")
     behavior = metadata.get('config', {}).get('behavior')
 
-    # Connect to the room
+    # Connect to room
     await ctx.connect()
     await asyncio.sleep(0.5)
 
@@ -76,22 +76,21 @@ async def entrypoint(ctx: agents.JobContext):
     config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
     voice = random.choice(config["voice_choices"])
 
-    # Custom forced transcribe mode
+    # Force whisper to transcribe
     class CustomWhisperSTT(openai.STT):
         async def transcribe(self, *args, **kwargs):
             kwargs["task"] = "transcribe"
             kwargs.pop("translate", None)
             return await super().transcribe(*args, **kwargs)
 
-    # ------------ transcription + llm hooks ----------------
+    # Transcription + LLM hooks
     async def on_transcription(text: str):
         print("🎙️ STT:", text)
 
     async def on_llm_output(text: str):
         print("🤖 LLM:", text)
-    # -------------------------------------------------------
 
-    # Create agent session
+    # Session
     session = AgentSession(
         stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
         llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
@@ -99,15 +98,24 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
     )
 
+    # Start
     await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
 
-    # ✅ this is the part you were missing
-    session.start_audio_stream(
-        on_transcription=on_transcription,
-        on_llm_output=on_llm_output,
-    )
+    # ✅ Hook STT / LLM events (old API)
+    @session.on("user_input_transcribed")
+    async def _on_user_input(ev):
+        text = ev.text
+        print("🎙️ STT:", text)
+        await on_transcription(text)
 
-    # Greeting setup
+    @session.on("conversation_item_added")
+    async def _on_llm_output(ev):
+        if ev.role == "assistant" and ev.type == "output_text":
+            text = ev.text
+            print("🤖 LLM:", text)
+            await on_llm_output(text)
+
+    # Greeting
     greeting_text = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
     if behavior:
         greeting_text = behavior.get("text", json.dumps(behavior)) if isinstance(behavior, dict) else str(behavior)
