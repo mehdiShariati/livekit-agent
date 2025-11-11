@@ -74,20 +74,7 @@ async def create_job(request: JobRequest):
 
     async with lock:
         # Check if agent already exists for this room
-        if request.room_name in active_dispatches:
-            existing = active_dispatches[request.room_name]
-            print(f"⚠️ [{timestamp}] Agent already exists in room {request.room_name}")
-            print(f"   Existing agent type: {existing['agent_type']}")
-            print(f"   Created at: {existing['timestamp']}")
-            print(f"   Dispatch ID: {existing['dispatch_id']}")
 
-            return {
-                "status": "already_exists",
-                "agent_type": existing['agent_type'],
-                "room": request.room_name,
-                "dispatch_id": existing['dispatch_id'],
-                "message": f"Agent already running in room {request.room_name}"
-            }
 
         try:
             # Create LiveKit API client
