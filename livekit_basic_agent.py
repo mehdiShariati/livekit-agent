@@ -138,13 +138,14 @@ async def entrypoint(ctx: agents.JobContext):
         async def on_llm_output(text: str):
             print("🤖 LLM:", text)
 
-        # sync wrappers required by .on()
         def _wrap_on_transcription(ev):
-            asyncio.create_task(on_transcription(ev.text))
+            # ev.transcript = string of detected text
+            asyncio.create_task(on_transcription(ev.transcript))
 
         def _wrap_on_llm_output(ev):
-            if ev.role == "assistant" and ev.type == "output_text":
-                asyncio.create_task(on_llm_output(ev.text))
+            # ev.item.output_text = assistant text response
+            if hasattr(ev.item, "output_text") and ev.item.output_text:
+                asyncio.create_task(on_llm_output(ev.item.output_text))
 
         # Register correct events for Conversation agent
         session.on("user_input_transcribed", _wrap_on_transcription)
