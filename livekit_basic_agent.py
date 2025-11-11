@@ -132,6 +132,13 @@ async def entrypoint(ctx: agents.JobContext):
         identities = [s.identity for s in speakers]
         print(f"🎤 Active speakers: {identities}")
 
+    @ctx.room.on("transcription_received")
+    def transcription_received(speakers):
+        print("===============================")
+        print(speakers)
+        print(speakers.__dict__)
+        print("===============================")
+
     # You can add additional events like track_published, track_unpublished, etc. similarly:
     # @ctx.room.on("track_published")
     # def track_published(publication, participant):
