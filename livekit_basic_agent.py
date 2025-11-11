@@ -143,6 +143,7 @@ async def entrypoint(ctx: agents.JobContext):
             asyncio.create_task(on_transcription(ev.transcript))
 
         def _wrap_on_llm_output(ev):
+            print(ev.item)
             # ev.item.output_text = assistant text response
             if hasattr(ev.item, "output_text") and ev.item.output_text:
                 asyncio.create_task(on_llm_output(ev.item.output_text))
