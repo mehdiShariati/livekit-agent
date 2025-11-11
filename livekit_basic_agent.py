@@ -60,15 +60,12 @@ async def entrypoint(ctx: agents.JobContext):
     agent_type = metadata.get("agent_type", "tutor")
     behavior = metadata.get('config', {}).get('behavior')
 
-    # Connect to room
+    # Connect to the room
     await ctx.connect()
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.5)  # wait for other agents
 
-    # Avoid duplicate agents
-    agent_count = sum(
-        1 for p in ctx.room.remote_participants.values()
-        if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
-    )
+    # Check for existing agents
+    agent_count = sum(1 for p in ctx.room.remote_participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
     if agent_count > 0:
         print(f"⚠️ {agent_count} agent(s) already present, skipping start")
         return
@@ -76,21 +73,21 @@ async def entrypoint(ctx: agents.JobContext):
     config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
     voice = random.choice(config["voice_choices"])
 
-    # Force whisper to transcribe
+    # Custom STT forcing transcription
     class CustomWhisperSTT(openai.STT):
         async def transcribe(self, *args, **kwargs):
             kwargs["task"] = "transcribe"
-            kwargs.pop("translate", None)
+            kwargs.pop("translate", False)
             return await super().transcribe(*args, **kwargs)
 
-    # Transcription + LLM hooks
     async def on_transcription(text: str):
-        print("🎙️ STT:", text)
+        print("🎙️ Got transcription:", text)
 
     async def on_llm_output(text: str):
-        print("🤖 LLM:", text)
+        print("🤖 LLM output:", text)
 
-    # Session
+
+    # Setup session
     session = AgentSession(
         stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
         llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
@@ -98,30 +95,78 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
     )
 
-    # Start
+    session.on("user_input_transcribed", on_transcription)
+    session.on("conversation_item_added", on_llm_output)
+
+    # Start agent session
     await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
 
-    # ✅ Hook STT / LLM events (old API)
-    @session.on("user_input_transcribed")
+    # Prepare greeting
+    greeting_text = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
+    if behavior:
+        if isinstance(behavior, dict):
+            greeting_text = behavior.get("text", json.dumps(behavior))
+        else:
+            greeting_text = str(behavior)
+
+    # Send greeting
+    await session.generate_reply(instructions=greeting_text)
+    print(f"✅ {agent_type} agent started successfully")
+
+    # -----------------------------
+    # Register all major events
+    # -----------------------------
+    def sync_task(fn, *args, **kwargs):
+        """Helper to run async code safely in sync callbacks"""
+        asyncio.create_task(fn(*args, **kwargs))
+
+    @ctx.room.on("participant_connected")
+    def participant_connected(participant: rtc.RemoteParticipant):
+        print(f"👤 Participant joined: {participant.identity}")
+
+    @ctx.room.on("participant_disconnected")
+    def participant_disconnected(participant: rtc.RemoteParticipant):
+        print(f"👤 Participant left: {participant.identity}")
+
+    @ctx.room.on("transcription_received")
+    def transcription_received(segments, participant, publication):
+        text = " ".join(seg.text for seg in segments)
+        print(f"🗣 Transcription from {participant.identity}: {text}")
+
+    @ctx.room.on("data_received")
+    def data_received(data_packet):
+        print(f"📨 Data received: {data_packet}")
+
+    @ctx.room.on("active_speakers_changed")
+    def active_speakers_changed(speakers):
+        identities = [s.identity for s in speakers]
+        print(f"🎤 Active speakers: {identities}")
+
+    @ctx.room.on("transcription_received")
+    def transcription_received(speakers):
+        print("===============================")
+        print(speakers)
+        print(speakers.__dict__)
+        print("===============================")
+
+    @ctx.room.on("user_input_transcribed")
     async def _on_user_input(ev):
         text = ev.text
         print("🎙️ STT:", text)
         await on_transcription(text)
 
-    @session.on("conversation_item_added")
+    @ctx.room.on("conversation_item_added")
     async def _on_llm_output(ev):
         if ev.role == "assistant" and ev.type == "output_text":
             text = ev.text
             print("🤖 LLM:", text)
             await on_llm_output(text)
 
-    # Greeting
-    greeting_text = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
-    if behavior:
-        greeting_text = behavior.get("text", json.dumps(behavior)) if isinstance(behavior, dict) else str(behavior)
 
-    await session.generate_reply(instructions=greeting_text)
-    print(f"✅ {agent_type} agent started successfully")
+    # You can add additional events like track_published, track_unpublished, etc. similarly:
+    # @ctx.room.on("track_published")
+    # def track_published(publication, participant):
+    #     ...
 
+    # Keep the agent alive
     await ctx.wait_for_participant()
-
