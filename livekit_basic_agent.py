@@ -5,36 +5,49 @@ import asyncio
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
-from livekit.plugins import openai, silero
+from livekit.plugins import openai, silero, simli
 
 # Load environment variables
 load_dotenv(".env")
 
-# -----------------------------
-# Agent Templates
-# -----------------------------
+# ---------------------------------------------
+# 🧱 Agent Template Configuration
+# ---------------------------------------------
 AGENT_TYPES = {
     "onboarding": {
-        "instructions": "You are a friendly onboarding guide who helps new users understand zabano.com. Speak in Persian. Keep responses short and warm.",
+        "instructions": """
+        You are a friendly onboarding guide who helps new users understand how to use the zabano.com platform.
+        Speak in Persian.
+        Keep responses short, warm, and motivating.
+        """,
         "voice_choices": ["nova"],
         "greeting": "سلام! به زبانو خوش آمدید. چطور می‌تونم کمکتون کنم؟"
     },
     "assessment": {
-        "instructions": "You are an English proficiency assessor. Speak partly in English, partly in Persian. Ask open questions, rate privately.",
+        "instructions": """
+        You are an English proficiency assessor.
+        Conduct a short conversation to evaluate user's English speaking and comprehension.
+        Ask open questions, rate them privately (don't show scores to user).
+        Speak partly in English, partly in Persian.
+        """,
         "voice_choices": ["coral", "verse"],
         "greeting": "Hello! سلام! Ready to test your English? آماده‌اید؟"
     },
     "tutor": {
-        "instructions": "You are an expert English tutor for Persian speakers. Explain grammar in Persian with English examples. Be kind and patient.",
+        "instructions": """
+        You are an expert English tutor for Persian speakers.
+        Always explain grammar in Persian and show clear English examples.
+        Be kind, interactive, and patient.
+        """,
         "voice_choices": ["nova", "coral"],
         "greeting": "سلام! من معلم انگلیسی شما هستم. بیایید شروع کنیم!"
     },
 }
 
 
-# -----------------------------
-# Dynamic Assistant
-# -----------------------------
+# ---------------------------------------------
+# 👩‍🏫 Dynamic Assistant class
+# ---------------------------------------------
 class DynamicAssistant(Agent):
     def __init__(self, agent_type="tutor"):
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
@@ -42,140 +55,130 @@ class DynamicAssistant(Agent):
         self.agent_type = agent_type
 
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
+# ---------------------------------------------
+# 🚀 Entrypoint
+# ---------------------------------------------
 async def entrypoint(ctx: agents.JobContext):
-    print(f"🚀 Agent starting in room: {ctx.room.name}")
+    """Main entrypoint for the LiveKit agent."""
 
     # Parse metadata
     metadata = {}
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
-            print(f"📦 Job metadata: {metadata}")
+            print(f"📦 Metadata: {metadata}")
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
-    agent_type = metadata.get("agent_type", "tutor")
-    behavior = metadata.get('config', {}).get('behavior')
+    # Validate this is a zabano job
+    if metadata.get("source") != "zabano":
+        if not metadata:
+            # Empty metadata - use default for testing
+            print("⚠️ No metadata provided, using default tutor agent")
+            agent_type = "tutor"
+        else:
+            print(f"⚠️ Ignoring non-zabano job: {metadata}")
+            return
+    else:
+        agent_type = metadata.get("agent_type", "tutor")
 
-    # Connect to the room
+    instruction = metadata.get('config')
+    behavior = ""
+    if instruction:
+        behavior = instruction.get('behavior')
+
+    # Connect to room
     await ctx.connect()
-    await asyncio.sleep(0.5)  # wait for other agents
 
-    # Check for existing agents
-    agent_count = sum(1 for p in ctx.room.remote_participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
+    # Wait a bit for other agents to appear (handle race condition)
+    await asyncio.sleep(0.5)
+
+    # Check if there are already agents in the room
+    participants = ctx.room.remote_participants
+    agent_count = 0
+    print(participants)
+    for participant in participants.values():
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            agent_count += 1
+            print(f"⚠️ Found existing agent in room: {participant.identity}")
+
     if agent_count > 0:
-        print(f"⚠️ {agent_count} agent(s) already present, skipping start")
+        print(f"⚠️ {agent_count} agent(s) already in room {ctx.room.name}, skipping")
         return
 
-    config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
-    voice = random.choice(config["voice_choices"])
+    print(f"✅ No existing agent found, proceeding to start {agent_type} agent")
 
-    # Custom STT forcing transcription
-    class CustomWhisperSTT(openai.STT):
-        async def transcribe(self, *args, **kwargs):
-            kwargs["task"] = "transcribe"
-            kwargs.pop("translate", False)
-            return await super().transcribe(*args, **kwargs)
+    try:
+        # Get configuration
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
+        voice = random.choice(config["voice_choices"])
 
-    # Setup session
-    session = AgentSession(
-        stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
-        llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
-        tts=openai.TTS(voice=voice),
-        vad=silero.VAD.load(),
-    )
+        print(f"✅ Starting {agent_type} agent in room {ctx.room.name} with voice {voice}")
 
-    # async handlers
-    async def on_transcription(text: str):
-        print("🎙️ STT:", text)
+        # Custom STT to force transcription (not translation)
+        class CustomWhisperSTT(openai.STT):
+            async def transcribe(self, *args, **kwargs):
+                # Force Whisper to transcribe (not translate)
+                kwargs["task"] = "transcribe"  # 👈 critical flag
+                kwargs.pop("translate", False)  # remove translation if passed accidentally
+                return await super().transcribe(*args, **kwargs)
 
-    async def on_llm_output(text: str):
-        print("🤖 LLM:", text)
+        # Setup session components
+        session = AgentSession(
+            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
+            llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
+            tts=openai.TTS(voice=voice),
+            vad=silero.VAD.load(),
+        )
 
-    # sync wrappers required by .on()
-    def _wrap_on_transcription(ev):
-        asyncio.create_task(on_transcription(ev.text))
+        # async handlers
+        async def on_transcription(text: str):
+            print("🎙️ STT:", text)
 
-    def _wrap_on_llm_output(ev):
-        if ev.role == "assistant" and ev.type == "output_text":
-            asyncio.create_task(on_llm_output(ev.text))
-
-    # Register correct events for Conversation agent
-    session.on("user_input_transcribed", _wrap_on_transcription)
-    session.on("conversation_item_added", _wrap_on_llm_output)
-
-    # Start agent session
-    await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
-
-    # Prepare greeting
-    greeting_text = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
-    if behavior:
-        if isinstance(behavior, dict):
-            greeting_text = behavior.get("text", json.dumps(behavior))
-        else:
-            greeting_text = str(behavior)
-
-    # Send greeting
-    await session.generate_reply(instructions=greeting_text)
-    print(f"✅ {agent_type} agent started successfully")
-
-    # -----------------------------
-    # Register all major events
-    # -----------------------------
-    def sync_task(fn, *args, **kwargs):
-        """Helper to run async code safely in sync callbacks"""
-        asyncio.create_task(fn(*args, **kwargs))
-
-    @ctx.room.on("participant_connected")
-    def participant_connected(participant: rtc.RemoteParticipant):
-        print(f"👤 Participant joined: {participant.identity}")
-
-    @ctx.room.on("participant_disconnected")
-    def participant_disconnected(participant: rtc.RemoteParticipant):
-        print(f"👤 Participant left: {participant.identity}")
-
-    @ctx.room.on("transcription_received")
-    def transcription_received(segments, participant, publication):
-        text = " ".join(seg.text for seg in segments)
-        print(f"🗣 Transcription from {participant.identity}: {text}")
-
-    @ctx.room.on("data_received")
-    def data_received(data_packet):
-        print(f"📨 Data received: {data_packet}")
-
-    @ctx.room.on("active_speakers_changed")
-    def active_speakers_changed(speakers):
-        identities = [s.identity for s in speakers]
-        print(f"🎤 Active speakers: {identities}")
-
-    @ctx.room.on("transcription_received")
-    def transcription_received(speakers):
-        print("===============================")
-        print(speakers)
-        print(speakers.__dict__)
-        print("===============================")
-
-    @ctx.room.on("user_input_transcribed")
-    async def _on_user_input(ev):
-        text = ev.text
-        print("🎙️ STT:", text)
-        await on_transcription(text)
-
-    @ctx.room.on("conversation_item_added")
-    async def _on_llm_output(ev):
-        if ev.role == "assistant" and ev.type == "output_text":
-            text = ev.text
+        async def on_llm_output(text: str):
             print("🤖 LLM:", text)
-            await on_llm_output(text)
+
+        # sync wrappers required by .on()
+        def _wrap_on_transcription(ev):
+            asyncio.create_task(on_transcription(ev.text))
+
+        def _wrap_on_llm_output(ev):
+            if ev.role == "assistant" and ev.type == "output_text":
+                asyncio.create_task(on_llm_output(ev.text))
+
+        # Register correct events for Conversation agent
+        session.on("user_input_transcribed", _wrap_on_transcription)
+        session.on("conversation_item_added", _wrap_on_llm_output)
+
+        # avatar = simli.AvatarSession(
+        #     simli_config=simli.SimliConfig(
+        #         api_key=os.getenv("SIMLI_API_KEY"),
+        #         face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",
+        #         # ID of the Simli face to use for your avatar. See "Face setup" for details.
+        #     ),
+        # )
+
+        # Start the avatar and wait for it to join
+        # await avatar.start(session, room=ctx.room)
+
+        # Start the session
+        await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
+        greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
+
+        # Send greeting
+        if behavior:
+            greeting = json.dumps(behavior)  # Don't stringify it, use it directly
+
+        await session.generate_reply(instructions=greeting)
+
+        print(f"✅ {agent_type} agent started successfully")
+
+    except Exception as e:
+        print(f"❌ Error starting agent: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
-    # You can add additional events like track_published, track_unpublished, etc. similarly:
-    # @ctx.room.on("track_published")
-    # def track_published(publication, participant):
-    #     ...
-
-    # Keep the agent alive
-    await ctx.wait_for_participant()
+if __name__ == "__main__":
+    agents.cli.run_app(entrypoint)
