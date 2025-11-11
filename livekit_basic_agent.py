@@ -131,16 +131,16 @@ async def entrypoint(ctx: agents.JobContext):
             vad=silero.VAD.load(),
         )
 
-        avatar = simli.AvatarSession(
-            simli_config=simli.SimliConfig(
-                api_key=os.getenv("SIMLI_API_KEY"),
-                face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",
-                # ID of the Simli face to use for your avatar. See "Face setup" for details.
-            ),
-        )
+        # avatar = simli.AvatarSession(
+        #     simli_config=simli.SimliConfig(
+        #         api_key=os.getenv("SIMLI_API_KEY"),
+        #         face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",
+        #         # ID of the Simli face to use for your avatar. See "Face setup" for details.
+        #     ),
+        # )
 
         # Start the avatar and wait for it to join
-        await avatar.start(session, room=ctx.room)
+        # await avatar.start(session, room=ctx.room)
 
         # Start the session
         await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
