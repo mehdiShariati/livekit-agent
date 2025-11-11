@@ -59,12 +59,14 @@ class DynamicAssistant(Agent):
 # Helper: Send events to Django
 # ----------------------------
 async def send_to_django(path, payload):
-    url = f"{DJANGO_URL}{path}"
-    async with aiohttp.ClientSession() as session:
-        try:
-            await session.post(url, json=payload)
-        except Exception as e:
-            print(f"❌ Failed sending to Django: {e}")
+    print(payload)
+    print("-----------------------------")
+    # url = f"{DJANGO_URL}{path}"
+    # async with aiohttp.ClientSession() as session:
+    #     try:
+    #         await session.post(url, json=payload)
+    #     except Exception as e:
+    #         print(f"❌ Failed sending to Django: {e}")
 
 # ----------------------------
 # Entrypoint
