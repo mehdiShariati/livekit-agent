@@ -80,13 +80,6 @@ async def entrypoint(ctx: agents.JobContext):
             kwargs.pop("translate", False)
             return await super().transcribe(*args, **kwargs)
 
-    async def on_transcription(text: str):
-        print("🎙️ Got transcription:", text)
-
-    async def on_llm_output(text: str):
-        print("🤖 LLM output:", text)
-
-
     # Setup session
     session = AgentSession(
         stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
@@ -95,8 +88,24 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
     )
 
-    session.on("user_input_transcribed", on_transcription)
-    session.on("conversation_item_added", on_llm_output)
+    # async handlers
+    async def on_transcription(text: str):
+        print("🎙️ STT:", text)
+
+    async def on_llm_output(text: str):
+        print("🤖 LLM:", text)
+
+    # sync wrappers required by .on()
+    def _wrap_on_transcription(ev):
+        asyncio.create_task(on_transcription(ev.text))
+
+    def _wrap_on_llm_output(ev):
+        if ev.role == "assistant" and ev.type == "output_text":
+            asyncio.create_task(on_llm_output(ev.text))
+
+    # Register correct events for Conversation agent
+    session.on("user_input_transcribed", _wrap_on_transcription)
+    session.on("conversation_item_added", _wrap_on_llm_output)
 
     # Start agent session
     await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
