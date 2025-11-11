@@ -1,6 +1,7 @@
 import json
 import random
 import os
+import requests
 import asyncio
 from dotenv import load_dotenv
 from livekit import agents, rtc
@@ -54,6 +55,19 @@ class DynamicAssistant(Agent):
         super().__init__(instructions=config["instructions"])
         self.agent_type = agent_type
 
+def send_to_backend(payload):
+    url = "https://api.zabano.com/api/livekit/webhook/"
+    headers = {
+        'sec-ch-ua-platform': '"Linux"',
+        'Referer': 'https://zabano.com/',
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
+        'sec-ch-ua-mobile': '?0',
+        'Content-Type': 'application/json'
+    }
+
+    requests.request("POST", url, headers=headers, data=payload)
 
 # ---------------------------------------------
 # 🚀 Entrypoint
@@ -144,10 +158,23 @@ async def entrypoint(ctx: agents.JobContext):
 
         def _wrap_on_llm_output(ev):
             if hasattr(ev.item, "role"):
-                if ev.item.role == "assistant":
-                    print(f"assistant: {ev.item.content}")
-                elif ev.item.role == "user":
-                    print(f"user: {ev.item.content}")
+                try:
+                    if ev.item.role == "assistant":
+                        role = 2
+                    elif ev.item.role == "user":
+                        role = 1
+                    else:
+                        role = 0
+
+                    payload = json.dumps({
+                        "room": ctx.room.name,
+                        "role": role,
+                        "event": "chat_message",
+                        "message": ev.item.content
+                    })
+                    send_to_backend(payload)
+                except Exception as e:
+                    print(e)
 
         # Register correct events for Conversation agent
         session.on("user_input_transcribed", _wrap_on_transcription)
