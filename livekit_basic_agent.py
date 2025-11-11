@@ -46,6 +46,7 @@ AGENT_TYPES = {
     },
 }
 
+
 # ----------------------------
 # Dynamic Assistant
 # ----------------------------
@@ -54,6 +55,7 @@ class DynamicAssistant(Agent):
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
         super().__init__(instructions=config["instructions"])
         self.agent_type = agent_type
+
 
 # ----------------------------
 # Helper: Send events to Django
@@ -67,6 +69,7 @@ async def send_to_django(path, payload):
     #         await session.post(url, json=payload)
     #     except Exception as e:
     #         print(f"❌ Failed sending to Django: {e}")
+
 
 # ----------------------------
 # Entrypoint
@@ -118,11 +121,11 @@ async def entrypoint(ctx: agents.JobContext):
     room_name = ctx.room.name
 
     # --- Register agent instance in Django ---
-    asyncio.create_task(send_to_django("/agent-instance/create/", {
+    send_to_django("/agent-instance/create/", {
         "dispatch_id": agent_id,
         "room_name": room_name,
         "agent_type": agent_type,
-    }))
+    })
 
     # ----------------------------
     # AgentSession event handlers
@@ -130,80 +133,80 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("assistant_message")
     def on_ai_message(ev):
         print(f"🤖 AI: {ev.text}")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "assistant_message",
             "text": ev.text
-        }))
+        })
 
     @session.on("user_message")
     def on_user_message(ev):
         print(f"🧑 User: {ev.text}")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "user_message",
             "text": ev.text
-        }))
+        })
 
     @session.on("transcription")
     def on_transcription(ev):
         print(f"📝 Transcription chunk: {ev.text}")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "transcription",
             "text": ev.text
-        }))
+        })
 
     @session.on("session_started")
     def on_session_started(ev):
         print("🚀 Session started")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "agent_started"
-        }))
+        })
 
     @session.on("session_ended")
     def on_session_ended(ev):
         print("🛑 Session ended")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "agent_finished"
-        }))
+        })
 
     @session.on("participant_joined")
     def on_participant_joined(ev):
         print(f"➕ Participant joined: {ev.participant.identity}")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "participant_joined",
             "participant": ev.participant.identity
-        }))
+        })
 
     @session.on("participant_left")
     def on_participant_left(ev):
         print(f"➖ Participant left: {ev.participant.identity}")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "participant_left",
             "participant": ev.participant.identity
-        }))
+        })
 
     @session.on("error")
     def on_error(ev):
         print(f"❌ Session error: {ev}")
-        asyncio.create_task(send_to_django("/livekit/agent-event/", {
+        send_to_django("/livekit/agent-event/", {
             "room": room_name,
             "agent_id": agent_id,
             "type": "error",
             "payload": str(ev)
-        }))
+        })
 
     # ----------------------------
     # Optional Simli Avatar Events
@@ -218,7 +221,7 @@ async def entrypoint(ctx: agents.JobContext):
     # @avatar.on("avatar_state_changed")
     # def on_avatar_state(ev):
     #     print(f"🎭 Avatar event: {ev}")
-    #     asyncio.create_task(send_to_django("/livekit/agent-event/", {
+    #     (send_to_django("/livekit/agent-event/", {
     #         "room": room_name,
     #         "agent_id": agent_id,
     #         "type": "avatar_event",
@@ -236,6 +239,7 @@ async def entrypoint(ctx: agents.JobContext):
     await session.generate_reply(instructions=greeting)
 
     print(f"✅ {agent_type} agent started successfully in room {room_name}")
+
 
 # ----------------------------
 # CLI Entry
