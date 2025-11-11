@@ -228,6 +228,11 @@ async def entrypoint(ctx: agents.JobContext):
     # --- Start session and send greeting ---
     await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
     greeting = behavior or config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
+
+    # If behavior is a dict, convert to string
+    if isinstance(greeting, dict):
+        greeting = json.dumps(greeting)
+
     await session.generate_reply(instructions=greeting)
 
     print(f"✅ {agent_type} agent started successfully in room {room_name}")
