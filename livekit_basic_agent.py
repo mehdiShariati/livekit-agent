@@ -145,9 +145,9 @@ async def entrypoint(ctx: agents.JobContext):
         def _wrap_on_llm_output(ev):
             if hasattr(ev.item, "role"):
                 if ev.item.role == "assistant":
-                    print(f"assistant: {ev.item.get("content")}")
+                    print(f"assistant: {ev.item.get('content')}")
                 elif ev.item.role == "user":
-                    print(f"user: {ev.item.get("content")}")
+                    print(f"user: {ev.item.get('content')}")
 
         # Register correct events for Conversation agent
         session.on("user_input_transcribed", _wrap_on_transcription)
