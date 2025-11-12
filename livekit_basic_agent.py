@@ -69,6 +69,22 @@ def send_to_backend(payload):
 
     requests.request("POST", url, headers=headers, data=payload)
 
+
+def log_to_file(room_name, role, message):
+    """Append chat messages to a text file per room."""
+    # Ensure directory exists
+    os.makedirs("chat_logs", exist_ok=True)
+
+    # Each room has its own file
+    file_path = os.path.join("chat_logs", f"{room_name}.txt")
+
+    # Format message block
+    formatted_message = f"{role}: {message}\n"
+
+    # Append message to file
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write(formatted_message)
+
 # ---------------------------------------------
 # 🚀 Entrypoint
 # ---------------------------------------------
@@ -160,21 +176,19 @@ async def entrypoint(ctx: agents.JobContext):
             if hasattr(ev.item, "role"):
                 try:
                     if ev.item.role == "assistant":
-                        role = 2
+                        role = "agent"
                     elif ev.item.role == "user":
-                        role = 1
+                        role = "user"
                     else:
-                        role = 0
+                        role = "system"  # optional fallback
 
-                    payload = json.dumps({
-                        "room": ctx.room.name,
-                        "role": role,
-                        "event": "chat_message",
-                        "message": ev.item.content
-                    })
-                    send_to_backend(payload)
+                    room_name = getattr(ctx.room, "name", "default_room")
+                    message = ev.item.content.strip()
+
+                    log_to_file(room_name, role, message)
+
                 except Exception as e:
-                    print(e)
+                    print("Error logging message:", e)
 
         # Register correct events for Conversation agent
         session.on("user_input_transcribed", _wrap_on_transcription)
