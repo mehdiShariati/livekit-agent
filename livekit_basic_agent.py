@@ -72,16 +72,11 @@ def send_to_backend(payload):
 
 def log_to_file(room_name, role, message):
     """Append chat messages to a text file per room."""
-    # Ensure directory exists
     os.makedirs("chat_logs", exist_ok=True)
-
-    # Each room has its own file
     file_path = os.path.join("chat_logs", f"{room_name}.txt")
 
-    # Format message block
     formatted_message = f"{role}: {message}\n"
 
-    # Append message to file
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(formatted_message)
 
@@ -180,10 +175,19 @@ async def entrypoint(ctx: agents.JobContext):
                     elif ev.item.role == "user":
                         role = "user"
                     else:
-                        role = "system"  # optional fallback
+                        role = "system"  # fallback
 
                     room_name = getattr(ctx.room, "name", "default_room")
-                    message = ev.item.content.strip()
+                    message = ev.item.content
+
+                    # Handle different content types
+                    if isinstance(message, list):
+                        # Join list elements into one string (convert non-strings safely)
+                        message = " ".join(str(m) for m in message)
+                    elif not isinstance(message, str):
+                        message = str(message)
+
+                    message = message.strip()
 
                     log_to_file(room_name, role, message)
 
