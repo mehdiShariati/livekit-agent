@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from livekit import api, agents
 from livekit_basic_agent import entrypoint
@@ -74,7 +75,6 @@ async def create_job(request: JobRequest):
 
     async with lock:
         # Check if agent already exists for this room
-
 
         try:
             # Create LiveKit API client
@@ -219,3 +219,20 @@ async def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+
+@app.get("/logs/{room_name}")
+async def get_chat_log(room_name: str):
+    log_dir = "chat_logs"
+    file_path = os.path.join(log_dir, f"{room_name}.txt")
+
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"No log file found for room '{room_name}'"
+        )
+
+    return FileResponse(
+        path=file_path,
+        filename=f"{room_name}.txt",
+        media_type="text/plain"
+    )
