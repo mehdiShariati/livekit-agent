@@ -55,6 +55,7 @@ class DynamicAssistant(Agent):
         super().__init__(instructions=config["instructions"])
         self.agent_type = agent_type
 
+
 def send_to_backend(payload):
     url = "https://api.zabano.com/api/livekit/webhook/"
     headers = {
@@ -79,6 +80,7 @@ def log_to_file(room_name, role, message):
 
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(formatted_message)
+
 
 # ---------------------------------------------
 # 🚀 Entrypoint
@@ -144,8 +146,8 @@ async def entrypoint(ctx: agents.JobContext):
         class CustomWhisperSTT(openai.STT):
             async def transcribe(self, *args, **kwargs):
                 # Force Whisper to transcribe (not translate)
-                kwargs["task"] = "transcribe"  # 👈 critical flag
-                kwargs.pop("translate", False)  # remove translation if passed accidentally
+                kwargs["task"] = "transcribe"
+                kwargs.pop("translate", False)
                 return await super().transcribe(*args, **kwargs)
 
         # Setup session components
@@ -156,7 +158,32 @@ async def entrypoint(ctx: agents.JobContext):
             vad=silero.VAD.load(),
         )
 
-        # async handlers
+        # ---------------------------------------------
+        # 🧹 Auto-cleanup when user leaves the room
+        # ---------------------------------------------
+        async def on_participant_disconnected(ev):
+            participant = ev.participant
+            print(f"👋 Participant left: {participant.identity}")
+
+            # Ignore if another agent disconnects
+            if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+                return
+
+            print("🛑 User left — stopping session and disconnecting agent...")
+
+            try:
+                await session.stop()
+            except Exception as e:
+                print("Error stopping session:", e)
+
+            try:
+                await ctx.room.disconnect()
+            except Exception as e:
+                print("Error disconnecting room:", e)
+
+        ctx.room.on("participant_disconnected", on_participant_disconnected)
+
+        # Async handlers
         async def on_transcription(text: str):
             print("🎙️ STT:", text)
 
@@ -164,7 +191,6 @@ async def entrypoint(ctx: agents.JobContext):
             print("🤖 LLM:", text)
 
         def _wrap_on_transcription(ev):
-            # ev.transcript = string of detected text
             asyncio.create_task(on_transcription(ev.transcript))
 
         def _wrap_on_llm_output(ev):
@@ -175,26 +201,22 @@ async def entrypoint(ctx: agents.JobContext):
                     elif ev.item.role == "user":
                         role = "user"
                     else:
-                        role = "system"  # fallback
+                        role = "system"
 
                     room_name = getattr(ctx.room, "name", "default_room")
                     message = ev.item.content
 
-                    # Handle different content types
                     if isinstance(message, list):
-                        # Join list elements into one string (convert non-strings safely)
                         message = " ".join(str(m) for m in message)
                     elif not isinstance(message, str):
                         message = str(message)
 
                     message = message.strip()
-
                     log_to_file(room_name, role, message)
 
                 except Exception as e:
                     print("Error logging message:", e)
 
-        # Register correct events for Conversation agent
         session.on("user_input_transcribed", _wrap_on_transcription)
         session.on("conversation_item_added", _wrap_on_llm_output)
 
@@ -213,9 +235,8 @@ async def entrypoint(ctx: agents.JobContext):
         await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
         greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
 
-        # Send greeting
         if behavior:
-            greeting = json.dumps(behavior)  # Don't stringify it, use it directly
+            greeting = json.dumps(behavior)
 
         await session.generate_reply(instructions=greeting)
 
