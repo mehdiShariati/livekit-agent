@@ -155,10 +155,11 @@ async def entrypoint(ctx: agents.JobContext):
 
             print("🛑 User left — cleaning up...")
 
+            # Proper LiveKit AgentSession cleanup
             try:
-                await session.stop()
+                await session.close()
             except Exception as e:
-                print("Error stopping session:", e)
+                print("Error closing session:", e)
 
             try:
                 await ctx.room.disconnect()
