@@ -45,7 +45,6 @@ AGENT_TYPES = {
     },
 }
 
-
 # ---------------------------------------------
 # 👩‍🏫 Dynamic Assistant class
 # ---------------------------------------------
@@ -88,7 +87,6 @@ def log_to_file(room_name, role, message):
 async def entrypoint(ctx: agents.JobContext):
     """Main entrypoint for the LiveKit agent."""
 
-    # Parse metadata
     metadata = {}
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
         try:
@@ -97,43 +95,41 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
-    # Validate this is a zabano job
     if metadata.get("source") != "zabano":
         if not metadata:
             print("⚠️ No metadata provided, using default tutor agent")
             agent_type = "tutor"
         else:
-            print(f"⚠️ Ignoring non-zabano job: {metadata}")
+            print(f"⚠️ Ignoring non-zabano job")
             return
     else:
         agent_type = metadata.get("agent_type", "tutor")
 
-    instruction = metadata.get('config')
+    instruction = metadata.get("config")
     behavior = ""
     if instruction:
-        behavior = instruction.get('behavior')
+        behavior = instruction.get("behavior")
 
     # Connect
     await ctx.connect()
     await asyncio.sleep(0.5)
 
-    # Check existing agents
+    # Detect existing agents
     participants = ctx.room.remote_participants
-    agent_count = sum(
-        1 for p in participants.values()
-        if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
-    )
+    agent_count = sum(1 for p in participants.values()
+                      if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
 
     if agent_count > 0:
-        print(f"⚠️ {agent_count} agent(s) already in room — skipping startup")
+        print("⚠️ Existing agent in room — skipping startup")
         return
 
-    print(f"✅ No existing agent — starting {agent_type}")
+    print(f"✅ Starting agent type: {agent_type}")
 
     try:
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
         voice = random.choice(config["voice_choices"])
 
+        # Custom Whisper STT to force transcription
         class CustomWhisperSTT(openai.STT):
             async def transcribe(self, *args, **kwargs):
                 kwargs["task"] = "transcribe"
@@ -149,16 +145,15 @@ async def entrypoint(ctx: agents.JobContext):
         )
 
         # ---------------------------------------------
-        # 🧹 FIXED: Proper user disconnect cleanup handler
+        # 🧹 Correct user disconnect cleanup
         # ---------------------------------------------
-        async def handle_user_left(ev):
-            participant = ev.participant
+        async def handle_user_left(participant):
             print(f"👋 Participant left: {participant.identity}")
 
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
 
-            print("🛑 User left — stopping session and disconnecting...")
+            print("🛑 User left — cleaning up...")
 
             try:
                 await session.stop()
@@ -168,15 +163,15 @@ async def entrypoint(ctx: agents.JobContext):
             try:
                 await ctx.room.disconnect()
             except Exception as e:
-                print("Error disconnecting:", e)
+                print("Error disconnecting room:", e)
 
-        def on_participant_disconnected(ev):
-            asyncio.create_task(handle_user_left(ev))
+        def on_participant_disconnected(participant):
+            asyncio.create_task(handle_user_left(participant))
 
         ctx.room.on("participant_disconnected", on_participant_disconnected)
 
         # ---------------------------------------------
-        # Logging events
+        # Logging
         # ---------------------------------------------
         async def on_transcription(text: str):
             print("🎙️ STT:", text)
@@ -188,20 +183,14 @@ async def entrypoint(ctx: agents.JobContext):
             asyncio.create_task(on_transcription(ev.transcript))
 
         def _wrap_on_llm_output(ev):
-            if hasattr(ev.item, "role"):
-                try:
-                    role = "agent" if ev.item.role == "assistant" else "user"
-                    message = ev.item.content
-
-                    if isinstance(message, list):
-                        message = " ".join(str(m) for m in message)
-                    elif not isinstance(message, str):
-                        message = str(message)
-
-                    log_to_file(ctx.room.name, role, message.strip())
-
-                except Exception as e:
-                    print("Error logging message:", e)
+            try:
+                role = "agent" if ev.item.role == "assistant" else "user"
+                content = ev.item.content
+                if isinstance(content, list):
+                    content = " ".join(str(c) for c in content)
+                log_to_file(ctx.room.name, role, str(content))
+            except Exception as e:
+                print("Error logging:", e)
 
         session.on("user_input_transcribed", _wrap_on_transcription)
         session.on("conversation_item_added", _wrap_on_llm_output)
@@ -225,8 +214,7 @@ async def entrypoint(ctx: agents.JobContext):
             greeting = json.dumps(behavior)
 
         await session.generate_reply(instructions=greeting)
-
-        print(f"✅ Agent started successfully")
+        print("✅ Agent started successfully")
 
     except Exception as e:
         print(f"❌ Error starting agent: {e}")
