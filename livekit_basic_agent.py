@@ -1,62 +1,27 @@
 import json
-import random
 import os
 import re
 import asyncio
-from datetime import datetime
+import random
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
-from livekit.plugins import openai, silero, simli
+from livekit.plugins import openai, silero
 
 # Load environment variables
 load_dotenv(".env")
 
-# ---------------------------------------------
-# 🧱 Agent Template Configuration
-# ---------------------------------------------
-AGENT_TYPES = {
-    "onboarding": {
-        "instructions": """
-        You are a friendly onboarding guide who helps new users understand how to use the zabano.com platform.
-        Speak in Persian.
-        Keep responses short, warm, and motivating.
-        """,
-        "voice_choices": ["nova"],
-        "greeting": "سلام! به زبانو خوش آمدید. چطور می‌تونم کمکتون کنم؟"
-    },
-    "assessment": {
-        "instructions": """
-        You are a language proficiency assessor.
-        Conduct a short conversation to evaluate user's {{language}} speaking and comprehension.
-        Ask open questions, rate them privately (don't show scores to user).
-        Speak partly in {{language}} and partly in user's native language.
-        """,
-        "voice_choices": ["coral", "verse"],
-        "greeting": "Hello! سلام! Ready to test your {{language}}? آماده‌اید؟"
-    },
-    "tutor": {
-        "instructions": """
-        You are an expert {{language}} tutor for Persian speakers.
-        Always explain grammar in Persian and show clear {{language}} examples.
-        Be kind, interactive, and patient.
-        """,
-        "voice_choices": ["nova", "coral"],
-        "greeting": "سلام! من معلم {{language}} شما هستم. بیایید شروع کنیم!"
-    },
-}
 
 # ---------------------------------------------
-# 👩‍🏫 Dynamic Assistant class
+# 👩‍🏫 Dynamic Assistant
 # ---------------------------------------------
 class DynamicAssistant(Agent):
-    def __init__(self, agent_type="tutor"):
-        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
-        super().__init__(instructions=config["instructions"])
-        self.agent_type = agent_type
+    def __init__(self, instructions=""):
+        super().__init__(instructions=instructions)
+
 
 # ---------------------------------------------
-# Logging
+# Logging helper
 # ---------------------------------------------
 def log_to_file(room_name, role, message):
     os.makedirs("chat_logs", exist_ok=True)
@@ -64,6 +29,21 @@ def log_to_file(room_name, role, message):
     formatted_message = f"{role}: {message}\n"
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(formatted_message)
+
+
+# ---------------------------------------------
+# Helper: Replace {{language}} recursively
+# ---------------------------------------------
+def replace_language(obj, target_language):
+    if isinstance(obj, dict):
+        return {k: replace_language(v, target_language) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [replace_language(v, target_language) for v in obj]
+    elif isinstance(obj, str):
+        return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
+    else:
+        return obj
+
 
 # ---------------------------------------------
 # 🚀 Entrypoint
@@ -79,59 +59,43 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
+    # Default to tutor if not zabano
     if metadata.get("source") != "zabano":
-        if not metadata:
-            print("⚠️ No metadata provided, using default tutor agent")
-            agent_type = "tutor"
-        else:
-            print(f"⚠️ Ignoring non-zabano job")
-            return
-    else:
-        agent_type = metadata.get("agent_type", "tutor")
+        print("⚠️ Non-zabano job, skipping...")
+        return
 
+    # Extract agent type and language
+    agent_type = metadata.get("agent_type", "tutor")
     target_language = metadata.get("language", "English")
-    instruction = metadata.get("config")
-    behavior = None
-    if instruction:
-        behavior = instruction.get("behavior")
+    config = metadata.get("config", {})
 
-        # Replace all {{language}} placeholders in behavior recursively
-        def replace_language(obj):
-            if isinstance(obj, dict):
-                return {k: replace_language(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [replace_language(v) for v in obj]
-            elif isinstance(obj, str):
-                return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
-            else:
-                return obj
-        behavior = replace_language(behavior)
+    # Replace all {{language}} placeholders in config
+    config = replace_language(config, target_language)
 
-    # Connect
+    # Connect to room
     await ctx.connect()
     await asyncio.sleep(0.5)
 
-    # Check existing agents
+    # Avoid multiple agents in same room
     participants = ctx.room.remote_participants
     agent_count = sum(1 for p in participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
     if agent_count > 0:
         print("⚠️ Existing agent in room — skipping startup")
         return
 
-    print(f"✅ Starting agent type: {agent_type} in language: {target_language}")
-
     try:
-        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
-        voice = random.choice(config["voice_choices"])
+        # Select voice randomly
+        voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
+        voice = random.choice(voice_choices)
 
-        # Custom Whisper STT to force transcription
+        # Custom Whisper STT
         class CustomWhisperSTT(openai.STT):
             async def transcribe(self, *args, **kwargs):
                 kwargs["task"] = "transcribe"
                 kwargs.pop("translate", False)
                 return await super().transcribe(*args, **kwargs)
 
-        # Create session
+        # Create agent session
         session = AgentSession(
             stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
             llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
@@ -139,27 +103,23 @@ async def entrypoint(ctx: agents.JobContext):
             vad=silero.VAD.load(),
         )
 
-        # ---------------------------------------------
         # Cleanup on user leave
-        # ---------------------------------------------
         async def handle_user_left(participant):
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
-            print("🛑 User left — cleaning up...")
-            try: await session.close()
-            except Exception as e: print("Error closing session:", e)
-            try: await ctx.room.disconnect()
-            except Exception as e: print("Error disconnecting room:", e)
+            try:
+                await session.close()
+            except Exception as e:
+                print("Error closing session:", e)
+            try:
+                await ctx.room.disconnect()
+            except Exception as e:
+                print("Error disconnecting room:", e)
 
-        def on_participant_disconnected(participant):
-            asyncio.create_task(handle_user_left(participant))
+        ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
-        ctx.room.on("participant_disconnected", on_participant_disconnected)
-
-        # ---------------------------------------------
         # Logging
-        # ---------------------------------------------
         async def on_transcription(text: str):
             print("🎙️ STT:", text)
 
@@ -193,17 +153,12 @@ async def entrypoint(ctx: agents.JobContext):
         # Start the avatar and wait for it to join
         # await avatar.start(session, room=ctx.room)
 
-        # Start the session
-        await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
-
-        # Generate greeting/instructions
-        greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
-        greeting = re.sub(r"\{\{\s*language\s*\}\}", target_language, greeting)
-
+        # Prepare instructions/greeting
+        behavior = config.get("behavior", {})
         if behavior:
             instructions_text = f"Target language: {target_language}\n{json.dumps(behavior, ensure_ascii=False)}"
         else:
-            instructions_text = greeting
+            instructions_text = f"Hello! Let's start your {target_language} session."
 
         await session.generate_reply(instructions=instructions_text)
         print("✅ Agent started successfully")
@@ -213,6 +168,7 @@ async def entrypoint(ctx: agents.JobContext):
         import traceback
         traceback.print_exc()
         raise
+
 
 # ---------------------------------------------
 # Run agent CLI
