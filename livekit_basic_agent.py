@@ -92,10 +92,20 @@ async def entrypoint(ctx: agents.JobContext):
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
-            try: await session.close()
-            except Exception as e: print("Error closing session:", e)
-            try: await ctx.room.disconnect()
-            except Exception as e: print("Error disconnecting room:", e)
+
+            try:
+                if hasattr(session, "stop") and callable(session.stop):
+                    await session.stop()  # Proper way to stop session
+                print("🛑 Agent session stopped")
+            except Exception as e:
+                print("Error stopping session:", e)
+
+            try:
+                if ctx.room.connected:
+                    await ctx.room.disconnect()
+                    print("🛑 Room disconnected")
+            except Exception as e:
+                print("Error disconnecting room:", e)
 
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
