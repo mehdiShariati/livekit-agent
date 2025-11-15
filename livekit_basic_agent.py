@@ -94,18 +94,23 @@ async def entrypoint(ctx: agents.JobContext):
                 return
 
             try:
+                # Stop agent session safely
                 if hasattr(session, "stop") and callable(session.stop):
-                    await session.stop()  # Proper way to stop session
-                print("🛑 Agent session stopped")
+                    await session.stop()
+                    print("🛑 Agent session stopped")
             except Exception as e:
-                print("Error stopping session:", e)
+                print("❌ Error stopping session:", e)
+
+            # Give a short delay to allow any in-flight transcription to complete
+            await asyncio.sleep(0.1)
 
             try:
-                if ctx.room.isconnected:
+                # Disconnect room only after session is fully stopped
+                if ctx.room.isconnected():
                     await ctx.room.disconnect()
                     print("🛑 Room disconnected")
             except Exception as e:
-                print("Error disconnecting room:", e)
+                print("❌ Error disconnecting room:", e)
 
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
