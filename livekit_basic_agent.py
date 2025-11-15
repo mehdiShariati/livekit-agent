@@ -1,8 +1,9 @@
 import json
 import random
 import os
-import requests
+import re
 import asyncio
+from datetime import datetime
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -26,22 +27,22 @@ AGENT_TYPES = {
     },
     "assessment": {
         "instructions": """
-        You are an English proficiency assessor.
-        Conduct a short conversation to evaluate user's English speaking and comprehension.
+        You are a language proficiency assessor.
+        Conduct a short conversation to evaluate user's {{language}} speaking and comprehension.
         Ask open questions, rate them privately (don't show scores to user).
-        Speak partly in English, partly in Persian.
+        Speak partly in {{language}} and partly in user's native language.
         """,
         "voice_choices": ["coral", "verse"],
-        "greeting": "Hello! سلام! Ready to test your English? آماده‌اید؟"
+        "greeting": "Hello! سلام! Ready to test your {{language}}? آماده‌اید؟"
     },
     "tutor": {
         "instructions": """
-        You are an expert English tutor for Persian speakers.
-        Always explain grammar in Persian and show clear English examples.
+        You are an expert {{language}} tutor for Persian speakers.
+        Always explain grammar in Persian and show clear {{language}} examples.
         Be kind, interactive, and patient.
         """,
         "voice_choices": ["nova", "coral"],
-        "greeting": "سلام! من معلم انگلیسی شما هستم. بیایید شروع کنیم!"
+        "greeting": "سلام! من معلم {{language}} شما هستم. بیایید شروع کنیم!"
     },
 }
 
@@ -54,32 +55,15 @@ class DynamicAssistant(Agent):
         super().__init__(instructions=config["instructions"])
         self.agent_type = agent_type
 
-
-def send_to_backend(payload):
-    url = "https://api.zabano.com/api/livekit/webhook/"
-    headers = {
-        'sec-ch-ua-platform': '"Linux"',
-        'Referer': 'https://zabano.com/',
-        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'sec-ch-ua': '"Chromium";v="140", "Not=A?Brand";v="24", "Google Chrome";v="140"',
-        'sec-ch-ua-mobile': '?0',
-        'Content-Type': 'application/json'
-    }
-
-    requests.request("POST", url, headers=headers, data=payload)
-
-
+# ---------------------------------------------
+# Logging
+# ---------------------------------------------
 def log_to_file(room_name, role, message):
-    """Append chat messages to a text file per room."""
     os.makedirs("chat_logs", exist_ok=True)
     file_path = os.path.join("chat_logs", f"{room_name}.txt")
-
     formatted_message = f"{role}: {message}\n"
-
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(formatted_message)
-
 
 # ---------------------------------------------
 # 🚀 Entrypoint
@@ -105,25 +89,36 @@ async def entrypoint(ctx: agents.JobContext):
     else:
         agent_type = metadata.get("agent_type", "tutor")
 
+    target_language = metadata.get("language", "English")
     instruction = metadata.get("config")
-    behavior = ""
+    behavior = None
     if instruction:
         behavior = instruction.get("behavior")
+
+        # Replace all {{language}} placeholders in behavior recursively
+        def replace_language(obj):
+            if isinstance(obj, dict):
+                return {k: replace_language(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [replace_language(v) for v in obj]
+            elif isinstance(obj, str):
+                return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
+            else:
+                return obj
+        behavior = replace_language(behavior)
 
     # Connect
     await ctx.connect()
     await asyncio.sleep(0.5)
 
-    # Detect existing agents
+    # Check existing agents
     participants = ctx.room.remote_participants
-    agent_count = sum(1 for p in participants.values()
-                      if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
-
+    agent_count = sum(1 for p in participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
     if agent_count > 0:
         print("⚠️ Existing agent in room — skipping startup")
         return
 
-    print(f"✅ Starting agent type: {agent_type}")
+    print(f"✅ Starting agent type: {agent_type} in language: {target_language}")
 
     try:
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
@@ -145,26 +140,17 @@ async def entrypoint(ctx: agents.JobContext):
         )
 
         # ---------------------------------------------
-        # 🧹 Correct user disconnect cleanup
+        # Cleanup on user leave
         # ---------------------------------------------
         async def handle_user_left(participant):
             print(f"👋 Participant left: {participant.identity}")
-
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
-
             print("🛑 User left — cleaning up...")
-
-            # Proper LiveKit AgentSession cleanup
-            try:
-                await session.close()
-            except Exception as e:
-                print("Error closing session:", e)
-
-            try:
-                await ctx.room.disconnect()
-            except Exception as e:
-                print("Error disconnecting room:", e)
+            try: await session.close()
+            except Exception as e: print("Error closing session:", e)
+            try: await ctx.room.disconnect()
+            except Exception as e: print("Error disconnecting room:", e)
 
         def on_participant_disconnected(participant):
             asyncio.create_task(handle_user_left(participant))
@@ -210,11 +196,16 @@ async def entrypoint(ctx: agents.JobContext):
         # Start the session
         await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
 
+        # Generate greeting/instructions
         greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
-        if behavior:
-            greeting = json.dumps(behavior)
+        greeting = re.sub(r"\{\{\s*language\s*\}\}", target_language, greeting)
 
-        await session.generate_reply(instructions=greeting)
+        if behavior:
+            instructions_text = f"Target language: {target_language}\n{json.dumps(behavior, ensure_ascii=False)}"
+        else:
+            instructions_text = greeting
+
+        await session.generate_reply(instructions=instructions_text)
         print("✅ Agent started successfully")
 
     except Exception as e:
@@ -223,6 +214,8 @@ async def entrypoint(ctx: agents.JobContext):
         traceback.print_exc()
         raise
 
-
+# ---------------------------------------------
+# Run agent CLI
+# ---------------------------------------------
 if __name__ == "__main__":
     agents.cli.run_app(entrypoint)
