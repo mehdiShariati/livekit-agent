@@ -101,7 +101,7 @@ async def entrypoint(ctx: agents.JobContext):
                 print("Error stopping session:", e)
 
             try:
-                if ctx.room.connected:
+                if ctx.room.isconnected:
                     await ctx.room.disconnect()
                     print("🛑 Room disconnected")
             except Exception as e:
