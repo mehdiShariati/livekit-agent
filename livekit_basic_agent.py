@@ -1,8 +1,8 @@
 import json
 import os
 import re
-import asyncio
 import random
+import asyncio
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -11,14 +11,12 @@ from livekit.plugins import openai, silero
 # Load environment variables
 load_dotenv(".env")
 
-
 # ---------------------------------------------
 # 👩‍🏫 Dynamic Assistant
 # ---------------------------------------------
 class DynamicAssistant(Agent):
     def __init__(self, instructions=""):
         super().__init__(instructions=instructions)
-
 
 # ---------------------------------------------
 # Logging helper
@@ -29,7 +27,6 @@ def log_to_file(room_name, role, message):
     formatted_message = f"{role}: {message}\n"
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(formatted_message)
-
 
 # ---------------------------------------------
 # Helper: Replace {{language}} recursively
@@ -43,7 +40,6 @@ def replace_language(obj, target_language):
         return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
     else:
         return obj
-
 
 # ---------------------------------------------
 # 🚀 Entrypoint
@@ -59,12 +55,12 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
-    # Default to tutor if not zabano
+    # Only handle Zabano jobs
     if metadata.get("source") != "zabano":
         print("⚠️ Non-zabano job, skipping...")
         return
 
-    # Extract agent type and language
+    # Extract agent type and target language
     agent_type = metadata.get("agent_type", "tutor")
     target_language = metadata.get("language", "English")
     config = metadata.get("config", {})
@@ -76,7 +72,7 @@ async def entrypoint(ctx: agents.JobContext):
     await ctx.connect()
     await asyncio.sleep(0.5)
 
-    # Avoid multiple agents in same room
+    # Avoid multiple agents in the same room
     participants = ctx.room.remote_participants
     agent_count = sum(1 for p in participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
     if agent_count > 0:
@@ -84,7 +80,7 @@ async def entrypoint(ctx: agents.JobContext):
         return
 
     try:
-        # Select voice randomly
+        # Select TTS voice
         voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
         voice = random.choice(voice_choices)
 
@@ -108,18 +104,14 @@ async def entrypoint(ctx: agents.JobContext):
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
-            try:
-                await session.close()
-            except Exception as e:
-                print("Error closing session:", e)
-            try:
-                await ctx.room.disconnect()
-            except Exception as e:
-                print("Error disconnecting room:", e)
+            try: await session.close()
+            except Exception as e: print("Error closing session:", e)
+            try: await ctx.room.disconnect()
+            except Exception as e: print("Error disconnecting room:", e)
 
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
-        # Logging
+        # Logging handlers
         async def on_transcription(text: str):
             print("🎙️ STT:", text)
 
@@ -150,17 +142,16 @@ async def entrypoint(ctx: agents.JobContext):
         #     ),
         # )
 
-        # Start the avatar and wait for it to join
-        # await avatar.start(session, room=ctx.room)
+        # Wait a bit to ensure session is fully running
+        await asyncio.sleep(0.5)
 
-        # Prepare instructions/greeting
+        # Prepare instructions/greeting from config
         behavior = config.get("behavior", {})
-        if behavior:
-            instructions_text = f"Target language: {target_language}\n{json.dumps(behavior, ensure_ascii=False)}"
-        else:
-            instructions_text = f"Hello! Let's start your {target_language} session."
+        instructions_text = f"Target language: {target_language}\n{json.dumps(behavior, ensure_ascii=False)}"
 
+        # Send initial greeting/instructions
         await session.generate_reply(instructions=instructions_text)
+
         print("✅ Agent started successfully")
 
     except Exception as e:
@@ -168,7 +159,6 @@ async def entrypoint(ctx: agents.JobContext):
         import traceback
         traceback.print_exc()
         raise
-
 
 # ---------------------------------------------
 # Run agent CLI
