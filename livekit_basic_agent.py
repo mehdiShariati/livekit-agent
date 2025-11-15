@@ -8,19 +8,18 @@ from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero
 
-# Load environment variables
 load_dotenv(".env")
 
-# ---------------------------------------------
-# 👩‍🏫 Dynamic Assistant
-# ---------------------------------------------
+# ----------------------------
+# Dynamic Assistant
+# ----------------------------
 class DynamicAssistant(Agent):
     def __init__(self, instructions=""):
         super().__init__(instructions=instructions)
 
-# ---------------------------------------------
+# ----------------------------
 # Logging helper
-# ---------------------------------------------
+# ----------------------------
 def log_to_file(room_name, role, message):
     os.makedirs("chat_logs", exist_ok=True)
     file_path = os.path.join("chat_logs", f"{room_name}.txt")
@@ -28,9 +27,9 @@ def log_to_file(room_name, role, message):
     with open(file_path, "a", encoding="utf-8") as f:
         f.write(formatted_message)
 
-# ---------------------------------------------
-# Helper: Replace {{language}} recursively
-# ---------------------------------------------
+# ----------------------------
+# Replace {{language}}
+# ----------------------------
 def replace_language(obj, target_language):
     if isinstance(obj, dict):
         return {k: replace_language(v, target_language) for k, v in obj.items()}
@@ -41,12 +40,10 @@ def replace_language(obj, target_language):
     else:
         return obj
 
-# ---------------------------------------------
-# 🚀 Entrypoint
-# ---------------------------------------------
+# ----------------------------
+# Entrypoint
+# ----------------------------
 async def entrypoint(ctx: agents.JobContext):
-    """Main entrypoint for the LiveKit agent."""
-
     metadata = {}
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
         try:
@@ -55,24 +52,19 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
-    # Only handle Zabano jobs
     if metadata.get("source") != "zabano":
         print("⚠️ Non-zabano job, skipping...")
         return
 
-    # Extract agent type and target language
     agent_type = metadata.get("agent_type", "tutor")
     target_language = metadata.get("language", "English")
     config = metadata.get("config", {})
 
-    # Replace all {{language}} placeholders in config
     config = replace_language(config, target_language)
 
-    # Connect to room
     await ctx.connect()
     await asyncio.sleep(0.5)
 
-    # Avoid multiple agents in the same room
     participants = ctx.room.remote_participants
     agent_count = sum(1 for p in participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
     if agent_count > 0:
@@ -80,18 +72,15 @@ async def entrypoint(ctx: agents.JobContext):
         return
 
     try:
-        # Select TTS voice
         voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
         voice = random.choice(voice_choices)
 
-        # Custom Whisper STT
         class CustomWhisperSTT(openai.STT):
             async def transcribe(self, *args, **kwargs):
                 kwargs["task"] = "transcribe"
                 kwargs.pop("translate", False)
                 return await super().transcribe(*args, **kwargs)
 
-        # Create agent session
         session = AgentSession(
             stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
             llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
@@ -99,7 +88,6 @@ async def entrypoint(ctx: agents.JobContext):
             vad=silero.VAD.load(),
         )
 
-        # Cleanup on user leave
         async def handle_user_left(participant):
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
@@ -111,45 +99,25 @@ async def entrypoint(ctx: agents.JobContext):
 
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
-        # Logging handlers
         async def on_transcription(text: str):
             print("🎙️ STT:", text)
 
         async def on_llm_output(text: str):
             print("🤖 LLM:", text)
 
-        def _wrap_on_transcription(ev):
-            asyncio.create_task(on_transcription(ev.transcript))
+        session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
+        session.on("conversation_item_added", lambda ev: log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content))
 
-        def _wrap_on_llm_output(ev):
-            try:
-                role = "agent" if ev.item.role == "assistant" else "user"
-                content = ev.item.content
-                if isinstance(content, list):
-                    content = " ".join(str(c) for c in content)
-                log_to_file(ctx.room.name, role, str(content))
-            except Exception as e:
-                print("Error logging:", e)
-
-        session.on("user_input_transcribed", _wrap_on_transcription)
-        session.on("conversation_item_added", _wrap_on_llm_output)
-
-        # avatar = simli.AvatarSession(
-        #     simli_config=simli.SimliConfig(
-        #         api_key=os.getenv("SIMLI_API_KEY"),
-        #         face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",
-        #         # ID of the Simli face to use for your avatar. See "Face setup" for details.
-        #     ),
-        # )
-
-        # Wait a bit to ensure session is fully running
-        await asyncio.sleep(0.5)
-
-        # Prepare instructions/greeting from config
+        # Create agent with instructions from behavior
         behavior = config.get("behavior", {})
-        instructions_text = f"Target language: {target_language}\n{json.dumps(behavior, ensure_ascii=False)}"
+        instructions_text = json.dumps(behavior, ensure_ascii=False)
+        agent = DynamicAssistant(instructions=instructions_text)
 
-        # Send initial greeting/instructions
+        # Start session with agent
+        await session.start(room=ctx.room, agent=agent)
+        await asyncio.sleep(0.5)  # ensure session is running
+
+        # Generate initial greeting / instructions
         await session.generate_reply(instructions=instructions_text)
 
         print("✅ Agent started successfully")
@@ -160,8 +128,8 @@ async def entrypoint(ctx: agents.JobContext):
         traceback.print_exc()
         raise
 
-# ---------------------------------------------
-# Run agent CLI
-# ---------------------------------------------
+# ----------------------------
+# Run CLI
+# ----------------------------
 if __name__ == "__main__":
     agents.cli.run_app(entrypoint)
