@@ -74,10 +74,10 @@ async def create_job(request: JobRequest):
     lock = await get_room_lock(request.room_name)
 
     async with lock:
-        # Check if agent already exists for this room
+        lkapi = None
 
         try:
-            # Create LiveKit API client
+            # Create the LiveKit API client
             lkapi = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
                 api_key=os.getenv("LIVEKIT_API_KEY"),
@@ -86,13 +86,12 @@ async def create_job(request: JobRequest):
 
             print(f"📤 [{timestamp}] Creating dispatch for room {request.room_name}...")
 
-            # Prepare metadata
+            # Build metadata
             metadata_dict = {
                 "agent_type": request.agent_type,
                 "source": "zabano"
             }
 
-            # Add config if provided
             if request.config:
                 metadata_dict["config"] = request.config
 
@@ -101,18 +100,16 @@ async def create_job(request: JobRequest):
                 api.CreateAgentDispatchRequest(
                     agent_name="zabano_agent",
                     room=request.room_name,
-                    metadata=json.dumps(metadata_dict)
+                    metadata=json.dumps(metadata_dict),
                 )
             )
 
-            await lkapi.aclose()
-
             # Track this dispatch
             active_dispatches[request.room_name] = {
-                'agent_type': request.agent_type,
-                'dispatch_id': dispatch.id,
-                'timestamp': timestamp,
-                'config': request.config
+                "agent_type": request.agent_type,
+                "dispatch_id": dispatch.id,
+                "timestamp": timestamp,
+                "config": request.config
             }
 
             print(f"✅ [{timestamp}] Dispatch created successfully!")
@@ -125,14 +122,17 @@ async def create_job(request: JobRequest):
                 "agent_type": request.agent_type,
                 "room": request.room_name,
                 "dispatch_id": dispatch.id,
-                "message": f"Agent {request.agent_type} started in room {request.room_name}"
+                "message": f"Agent {request.agent_type} started in room {request.room_name}",
             }
 
         except Exception as e:
-            print(f"❌ [{timestamp}] Dispatch error: {e}")
             import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
+
+        finally:
+            if lkapi:
+                await lkapi.aclose()
 
 
 @app.delete("/jobs/{room_name}")
