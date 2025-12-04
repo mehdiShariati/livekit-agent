@@ -1,6 +1,7 @@
 import json
 import os
 import asyncio
+import asyncpg
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -10,12 +11,28 @@ from livekit import api, agents
 from livekit_basic_agent import entrypoint
 from fastapi.responses import StreamingResponse
 import io
-from livekit_basic_agent import init_db_pool, DB_POOL
+
+
 
 # Load environment variables
 load_dotenv(".env")
 
 app = FastAPI(title="LiveKit Agent Manager")
+
+DB_POOL = None
+
+async def init_db_pool():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=os.getenv("POSTGRES_URL"),
+            min_size=1,
+            max_size=5
+        )
+
+@app.on_event("startup")
+async def startup_event():
+    await init_db_pool()
 
 # Track active dispatches per room with details
 active_dispatches = {}
@@ -225,8 +242,9 @@ async def health_check():
 
 @app.get("/logs/{room_name}")
 async def get_chat_log(room_name: str):
-    # Connect to DB
-    await init_db_pool()
+    global DB_POOL
+    if DB_POOL is None:
+        raise HTTPException(status_code=500, detail="Database pool is not initialized")
 
     query = """
         SELECT role, message, created_at
@@ -244,23 +262,12 @@ async def get_chat_log(room_name: str):
             detail=f"No logs found for room '{room_name}'"
         )
 
-    # Convert records to the original text format
-    lines = []
-    for rec in records:
-        role = rec["role"]
-        message = rec["message"]
-        lines.append(f"{role}: {message}")
+    # Build the text content
+    content = "\n".join(f"{r['role']}: {r['message']}" for r in records)
+    buffer = io.BytesIO(content.encode("utf-8"))
 
-    txt_content = "\n".join(lines)
-
-    # Create in-memory file
-    buffer = io.BytesIO(txt_content.encode("utf-8"))
-
-    # Return as downloadable TXT
     return StreamingResponse(
         buffer,
         media_type="text/plain",
-        headers={
-            "Content-Disposition": f"attachment; filename={room_name}.txt"
-        }
+        headers={"Content-Disposition": f"attachment; filename={room_name}.txt"}
     )
