@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero
+import psutil
 
 load_dotenv(".env")
 
@@ -26,10 +27,8 @@ LOG_FILES = {}
 def log_to_file(room_name, role, message):
     os.makedirs("chat_logs", exist_ok=True)
     file_path = os.path.join("chat_logs", f"{room_name}.txt")
-
     if room_name not in LOG_FILES:
         LOG_FILES[room_name] = open(file_path, "a", encoding="utf-8")
-
     f = LOG_FILES[room_name]
     f.write(f"{role}: {message}\n")
     f.flush()
@@ -87,6 +86,7 @@ async def entrypoint(ctx: agents.JobContext):
         return
 
     session_active = True  # flag to prevent logging after shutdown
+    session = None  # placeholder for AgentSession
 
     try:
         voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
@@ -109,7 +109,7 @@ async def entrypoint(ctx: agents.JobContext):
         # Participant left handler
         # ----------------------------
         async def handle_user_left(participant):
-            nonlocal session_active
+            nonlocal session_active, session
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
@@ -117,7 +117,9 @@ async def entrypoint(ctx: agents.JobContext):
             session_active = False  # prevent logging after shutdown
 
             try:
-                await session.aclose()  # safely stop all agent tasks
+                if session is not None:
+                    await session.aclose()  # safely stop all agent tasks
+                    session.conversation_history.clear()  # release memory
             except Exception as e:
                 print("❌ Error stopping session:", e)
 
@@ -131,10 +133,15 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 print("❌ Error disconnecting room:", e)
 
+            # Force cancel all lingering tasks to free memory
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task() and not task.done():
+                    task.cancel()
+
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
         # ----------------------------
-        # Event handlers
+        # Event handlers with debounce
         # ----------------------------
         last_stt_time = 0
         async def on_transcription(text: str):
@@ -148,6 +155,10 @@ async def entrypoint(ctx: agents.JobContext):
         async def on_llm_output(text: str):
             if session_active:
                 print("🤖 LLM:", text)
+
+        # Clear previous callbacks to avoid memory leaks
+        if hasattr(session, "_callbacks"):
+            session._callbacks.clear()
 
         session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
         session.on(
@@ -176,6 +187,12 @@ async def entrypoint(ctx: agents.JobContext):
         # Generate initial greeting / instructions
         await session.generate_reply(instructions=instructions_text)
         print("✅ Agent started successfully")
+
+        # ----------------------------
+        # Memory monitoring (optional)
+        # ----------------------------
+        process = psutil.Process(os.getpid())
+        print(f"Memory usage at startup: {process.memory_info().rss / 1024**2:.2f} MB")
 
     except Exception as e:
         print(f"❌ Error starting agent: {e}")
