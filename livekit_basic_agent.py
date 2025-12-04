@@ -10,141 +10,86 @@ from livekit.plugins import openai, silero
 
 load_dotenv(".env")
 
-# ----------------------------
-# Dynamic Assistant
-# ----------------------------
-class DynamicAssistant(Agent):
-    def __init__(self, instructions=""):
-        super().__init__(instructions=instructions)
-
-# ----------------------------
-# Logging helper
-# ----------------------------
-def log_to_file(room_name, role, message):
+def log_to_file(room, role, message):
     os.makedirs("chat_logs", exist_ok=True)
-    file_path = os.path.join("chat_logs", f"{room_name}.txt")
-    formatted_message = f"{role}: {message}\n"
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(formatted_message)
+    with open(f"chat_logs/{room}.txt", "a", encoding="utf-8") as f:
+        f.write(f"{role}: {message}\n")
 
-# ----------------------------
-# Replace {{language}}
-# ----------------------------
+
 def replace_language(obj, target_language):
     if isinstance(obj, dict):
         return {k: replace_language(v, target_language) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [replace_language(v, target_language) for v in obj]
-    elif isinstance(obj, str):
+    if isinstance(obj, list):
+        return [replace_language(i, target_language) for i in obj]
+    if isinstance(obj, str):
         return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
-    else:
-        return obj
+    return obj
 
-# ----------------------------
-# Entrypoint
-# ----------------------------
+
+class DynamicAssistant(Agent):
+    pass
+
+
 async def entrypoint(ctx: agents.JobContext):
-    metadata = {}
-    if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
-        try:
-            metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
-            print(f"📦 Metadata: {metadata}")
-        except Exception as e:
-            print(f"❌ Failed to parse metadata: {e}")
 
-    if metadata.get("source") != "zabano":
-        print("⚠️ Non-zabano job, skipping...")
+    meta = {}
+    if ctx.job.metadata:
+        try: meta = json.loads(ctx.job.metadata)
+        except: pass
+
+    if meta.get("source") != "zabano":
         return
 
-    agent_type = metadata.get("agent_type", "tutor")
-    target_language = metadata.get("language", "English")
-    config = metadata.get("config", {})
-
-    config = replace_language(config, target_language)
+    agent_type = meta.get("agent_type", "tutor")
+    target_language = meta.get("language", "English")
+    config = replace_language(meta.get("config", {}), target_language)
 
     await ctx.connect()
-    await asyncio.sleep(0.5)
 
-    participants = ctx.room.remote_participants
-    agent_count = sum(1 for p in participants.values() if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
-    if agent_count > 0:
-        print("⚠️ Existing agent in room — skipping startup")
+    if any(p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT for p in ctx.room.remote_participants.values()):
+        print("Agent already running — skipping")
         return
 
-    try:
-        voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
-        voice = random.choice(voice_choices)
+    voice = random.choice(config.get("livekit", {}).get("voice_choices", ["nova"]))
 
-        class CustomWhisperSTT(openai.STT):
-            async def transcribe(self, *args, **kwargs):
-                kwargs["task"] = "transcribe"
-                kwargs.pop("translate", False)
-                return await super().transcribe(*args, **kwargs)
+    class CustomWhisperSTT(openai.STT):
+        async def transcribe(self, *a, **kw):
+            kw["task"] = "transcribe"
+            kw.pop("translate", None)
+            return await super().transcribe(*a, **kw)
 
-        session = AgentSession(
-            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
-            llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
-            tts=openai.TTS(voice=voice),
-            vad=silero.VAD.load(),
+    session = AgentSession(
+        stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
+        llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
+        tts=openai.TTS(voice=voice),
+        vad=silero.VAD.load(),
+    )
+
+    async def on_left(p):
+        if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT: return
+        await session.stop()
+        await asyncio.sleep(0.25)
+        await ctx.room.disconnect()
+
+    ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(on_left(p)))
+
+    session.on("conversation_item_added",
+        lambda ev: log_to_file(
+            ctx.room.name,
+            "assistant" if ev.item.role == "assistant" else "user",
+            " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content
         )
+    )
 
-        async def handle_user_left(participant):
-            print(f"👋 Participant left: {participant.identity}")
-            if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
-                return
+    instructions = json.dumps(config.get("behavior", {}), ensure_ascii=False)
+    agent = DynamicAssistant(instructions=instructions)
 
-            try:
-                # Stop agent session safely
-                if hasattr(session, "stop") and callable(session.stop):
-                    await session.stop()
-                    print("🛑 Agent session stopped")
-            except Exception as e:
-                print("❌ Error stopping session:", e)
+    await session.start(ctx.room, agent)
+    await asyncio.sleep(0.25)
+    await session.generate_reply(instructions=instructions)
 
-            # Give a short delay to allow any in-flight transcription to complete
-            await asyncio.sleep(0.1)
+    print("Agent started ✔️")
 
-            try:
-                # Disconnect room only after session is fully stopped
-                if ctx.room.isconnected():
-                    await ctx.room.disconnect()
-                    print("🛑 Room disconnected")
-            except Exception as e:
-                print("❌ Error disconnecting room:", e)
 
-        ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
-
-        async def on_transcription(text: str):
-            print("🎙️ STT:", text)
-
-        async def on_llm_output(text: str):
-            print("🤖 LLM:", text)
-
-        session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
-        session.on("conversation_item_added", lambda ev: log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content))
-
-        # Create agent with instructions from behavior
-        behavior = config.get("behavior", {})
-        instructions_text = json.dumps(behavior, ensure_ascii=False)
-        agent = DynamicAssistant(instructions=instructions_text)
-
-        # Start session with agent
-        await session.start(room=ctx.room, agent=agent)
-        await asyncio.sleep(0.5)  # ensure session is running
-
-        # Generate initial greeting / instructions
-        await session.generate_reply(instructions=instructions_text)
-
-        print("✅ Agent started successfully")
-
-    except Exception as e:
-        print(f"❌ Error starting agent: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-# ----------------------------
-# Run CLI
-# ----------------------------
 if __name__ == "__main__":
     agents.cli.run_app(entrypoint)
