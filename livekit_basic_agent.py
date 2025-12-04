@@ -106,7 +106,7 @@ async def entrypoint(ctx: agents.JobContext):
             print("🤖 LLM:", text)
 
         session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
-        session.on("conversation_item_added", lambda ev: log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content))
+        # session.on("conversation_item_added", lambda ev: log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content))
 
         # Create agent with instructions from behavior
         behavior = config.get("behavior", {})
