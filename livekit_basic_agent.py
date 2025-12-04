@@ -3,6 +3,7 @@ import os
 import re
 import random
 import asyncio
+import asyncpg
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -10,39 +11,32 @@ from livekit.plugins import openai, silero
 
 load_dotenv(".env")
 
-# ----------------------------
-# Dynamic Assistant
-# ----------------------------
+
+DB_POOL = None
+
+async def init_db_pool():
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=os.getenv("POSTGRES_URL"),   # e.g. postgres://user:pass@host/dbname
+            min_size=1,
+            max_size=5
+        )
+
+async def log_to_postgres(room_name, role, message):
+    await init_db_pool()
+    query = """
+        INSERT INTO chat_logs (room_name, role, message, created_at)
+        VALUES ($1, $2, $3, NOW())
+    """
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(query, room_name, role, message)
+
+
 class DynamicAssistant(Agent):
     def __init__(self, instructions=""):
         super().__init__(instructions=instructions)
 
-# ----------------------------
-# Logging helper
-# ----------------------------
-def log_to_file(room_name, role, message):
-    os.makedirs("chat_logs", exist_ok=True)
-    file_path = os.path.join("chat_logs", f"{room_name}.txt")
-    formatted_message = f"{role}: {message}\n"
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(formatted_message)
-
-# ----------------------------
-# Replace {{language}}
-# ----------------------------
-def replace_language(obj, target_language):
-    if isinstance(obj, dict):
-        return {k: replace_language(v, target_language) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [replace_language(v, target_language) for v in obj]
-    elif isinstance(obj, str):
-        return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
-    else:
-        return obj
-
-# ----------------------------
-# Entrypoint
-# ----------------------------
 async def entrypoint(ctx: agents.JobContext):
     metadata = {}
     if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
@@ -56,11 +50,7 @@ async def entrypoint(ctx: agents.JobContext):
         print("⚠️ Non-zabano job, skipping...")
         return
 
-    agent_type = metadata.get("agent_type", "tutor")
-    target_language = metadata.get("language", "English")
     config = metadata.get("config", {})
-
-    config = replace_language(config, target_language)
 
     await ctx.connect()
     await asyncio.sleep(0.5)
@@ -92,10 +82,14 @@ async def entrypoint(ctx: agents.JobContext):
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
-            try: await session.close()
-            except Exception as e: print("Error closing session:", e)
-            try: await ctx.room.disconnect()
-            except Exception as e: print("Error disconnecting room:", e)
+            try:
+                await session.close()
+            except Exception as e:
+                print("Error closing session:", e)
+            try:
+                await ctx.room.disconnect()
+            except Exception as e:
+                print("Error disconnecting room:", e)
 
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
@@ -106,18 +100,25 @@ async def entrypoint(ctx: agents.JobContext):
             print("🤖 LLM:", text)
 
         session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
-        # session.on("conversation_item_added", lambda ev: log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content))
 
-        # Create agent with instructions from behavior
+        session.on(
+            "conversation_item_added",
+            lambda ev: asyncio.create_task(
+                log_to_postgres(
+                    ctx.room.name,
+                    "assistant" if ev.item.role == "assistant" else "user",
+                    " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content
+                )
+            )
+        )
+
         behavior = config.get("behavior", {})
         instructions_text = json.dumps(behavior, ensure_ascii=False)
         agent = DynamicAssistant(instructions=instructions_text)
 
-        # Start session with agent
         await session.start(room=ctx.room, agent=agent)
-        await asyncio.sleep(0.5)  # ensure session is running
+        await asyncio.sleep(0.5)
 
-        # Generate initial greeting / instructions
         await session.generate_reply(instructions=instructions_text)
 
         print("✅ Agent started successfully")
@@ -128,8 +129,5 @@ async def entrypoint(ctx: agents.JobContext):
         traceback.print_exc()
         raise
 
-# ----------------------------
-# Run CLI
-# ----------------------------
 if __name__ == "__main__":
     agents.cli.run_app(entrypoint)
