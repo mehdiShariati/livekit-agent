@@ -27,7 +27,8 @@ def replace_language(obj, target_language):
 
 
 class DynamicAssistant(Agent):
-    pass
+    def __init__(self, instructions=""):
+        super().__init__(instructions=instructions)
 
 
 async def entrypoint(ctx: agents.JobContext):
