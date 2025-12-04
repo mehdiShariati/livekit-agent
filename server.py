@@ -8,6 +8,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from livekit import api, agents
 from livekit_basic_agent import entrypoint
+from fastapi.responses import StreamingResponse
+import io
+from livekit_basic_agent import init_db_pool, DB_POOL
 
 # Load environment variables
 load_dotenv(".env")
@@ -222,17 +225,42 @@ async def health_check():
 
 @app.get("/logs/{room_name}")
 async def get_chat_log(room_name: str):
-    log_dir = "chat_logs"
-    file_path = os.path.join(log_dir, f"{room_name}.txt")
+    # Connect to DB
+    await init_db_pool()
 
-    if not os.path.exists(file_path):
+    query = """
+        SELECT role, message, created_at
+        FROM chat_logs
+        WHERE room_name = $1
+        ORDER BY created_at ASC
+    """
+
+    async with DB_POOL.acquire() as conn:
+        records = await conn.fetch(query, room_name)
+
+    if not records:
         raise HTTPException(
             status_code=404,
-            detail=f"No log file found for room '{room_name}'"
+            detail=f"No logs found for room '{room_name}'"
         )
 
-    return FileResponse(
-        path=file_path,
-        filename=f"{room_name}.txt",
-        media_type="text/plain"
+    # Convert records to the original text format
+    lines = []
+    for rec in records:
+        role = rec["role"]
+        message = rec["message"]
+        lines.append(f"{role}: {message}")
+
+    txt_content = "\n".join(lines)
+
+    # Create in-memory file
+    buffer = io.BytesIO(txt_content.encode("utf-8"))
+
+    # Return as downloadable TXT
+    return StreamingResponse(
+        buffer,
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": f"attachment; filename={room_name}.txt"
+        }
     )
