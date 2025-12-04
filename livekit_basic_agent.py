@@ -73,7 +73,6 @@ async def entrypoint(ctx: agents.JobContext):
     async def on_left(p):
         if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
             return
-        await session.close()
         await asyncio.sleep(0.25)
         await ctx.room.disconnect()
 
