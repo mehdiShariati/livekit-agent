@@ -85,8 +85,8 @@ async def entrypoint(ctx: agents.JobContext):
         print("⚠️ Existing agent in room — skipping startup")
         return
 
-    session_active = True  # flag to prevent logging after shutdown
-    session = None  # placeholder for AgentSession
+    session_active = True
+    session = None  # placeholder
 
     try:
         voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
@@ -114,12 +114,11 @@ async def entrypoint(ctx: agents.JobContext):
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
 
-            session_active = False  # prevent logging after shutdown
+            session_active = False
 
             try:
                 if session is not None:
                     await session.aclose()  # safely stop all agent tasks
-                    session.conversation_history.clear()  # release memory
             except Exception as e:
                 print("❌ Error stopping session:", e)
 
@@ -133,7 +132,7 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 print("❌ Error disconnecting room:", e)
 
-            # Force cancel all lingering tasks to free memory
+            # Cancel all remaining tasks to free memory
             for task in asyncio.all_tasks():
                 if task is not asyncio.current_task() and not task.done():
                     task.cancel()
@@ -147,7 +146,7 @@ async def entrypoint(ctx: agents.JobContext):
         async def on_transcription(text: str):
             nonlocal last_stt_time
             now = time.time()
-            if now - last_stt_time > 0.2:  # debounce STT logging
+            if now - last_stt_time > 0.2:
                 last_stt_time = now
                 if session_active:
                     print("🎙️ STT:", text)
@@ -180,16 +179,16 @@ async def entrypoint(ctx: agents.JobContext):
         instructions_text = json.dumps(behavior, ensure_ascii=False)
         agent = DynamicAssistant(instructions=instructions_text)
 
-        # Start session with agent
+        # Start session
         await session.start(room=ctx.room, agent=agent)
         await asyncio.sleep(0.5)
 
-        # Generate initial greeting / instructions
+        # Generate initial greeting
         await session.generate_reply(instructions=instructions_text)
         print("✅ Agent started successfully")
 
         # ----------------------------
-        # Memory monitoring (optional)
+        # Memory usage check (safe)
         # ----------------------------
         process = psutil.Process(os.getpid())
         print(f"Memory usage at startup: {process.memory_info().rss / 1024**2:.2f} MB")
