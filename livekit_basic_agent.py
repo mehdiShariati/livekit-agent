@@ -36,11 +36,11 @@ async def file_writer():
         finally:
             file_write_queue.task_done()
 
-# Start background writer task
-asyncio.create_task(file_writer())
-
 async def log_to_file(room_name, role, message):
     await file_write_queue.put((room_name, role, message))
+
+# Start background writer task
+asyncio.create_task(file_writer())
 
 # ----------------------------
 # Replace {{language}}
