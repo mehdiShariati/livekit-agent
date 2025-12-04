@@ -3,6 +3,7 @@ import os
 import re
 import random
 import asyncio
+import time
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -18,14 +19,28 @@ class DynamicAssistant(Agent):
         super().__init__(instructions=instructions)
 
 # ----------------------------
-# Logging helper
+# Logging helpers (persistent file handles)
 # ----------------------------
+LOG_FILES = {}
+
 def log_to_file(room_name, role, message):
     os.makedirs("chat_logs", exist_ok=True)
     file_path = os.path.join("chat_logs", f"{room_name}.txt")
-    formatted_message = f"{role}: {message}\n"
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(formatted_message)
+
+    if room_name not in LOG_FILES:
+        LOG_FILES[room_name] = open(file_path, "a", encoding="utf-8")
+
+    f = LOG_FILES[room_name]
+    f.write(f"{role}: {message}\n")
+    f.flush()
+
+def close_log_file(room_name):
+    if room_name in LOG_FILES:
+        try:
+            LOG_FILES[room_name].close()
+        except Exception:
+            pass
+        del LOG_FILES[room_name]
 
 # ----------------------------
 # Replace {{language}}
@@ -71,6 +86,8 @@ async def entrypoint(ctx: agents.JobContext):
         print("⚠️ Existing agent in room — skipping startup")
         return
 
+    session_active = True  # flag to prevent logging after shutdown
+
     try:
         voice_choices = config.get("livekit", {}).get("voice_choices", ["nova"])
         voice = random.choice(voice_choices)
@@ -88,24 +105,26 @@ async def entrypoint(ctx: agents.JobContext):
             vad=silero.VAD.load(),
         )
 
+        # ----------------------------
+        # Participant left handler
+        # ----------------------------
         async def handle_user_left(participant):
+            nonlocal session_active
             print(f"👋 Participant left: {participant.identity}")
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
 
+            session_active = False  # prevent logging after shutdown
+
             try:
-                # Stop agent session safely
-                if hasattr(session, "stop") and callable(session.stop):
-                    await session.stop()
-                    print("🛑 Agent session stopped")
+                await session.aclose()  # safely stop all agent tasks
             except Exception as e:
                 print("❌ Error stopping session:", e)
 
-            # Give a short delay to allow any in-flight transcription to complete
-            await asyncio.sleep(0.1)
+            close_log_file(ctx.room.name)
 
+            await asyncio.sleep(0.1)
             try:
-                # Disconnect room only after session is fully stopped
                 if ctx.room.isconnected():
                     await ctx.room.disconnect()
                     print("🛑 Room disconnected")
@@ -114,27 +133,48 @@ async def entrypoint(ctx: agents.JobContext):
 
         ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(handle_user_left(p)))
 
+        # ----------------------------
+        # Event handlers
+        # ----------------------------
+        last_stt_time = 0
         async def on_transcription(text: str):
-            print("🎙️ STT:", text)
+            nonlocal last_stt_time
+            now = time.time()
+            if now - last_stt_time > 0.2:  # debounce STT logging
+                last_stt_time = now
+                if session_active:
+                    print("🎙️ STT:", text)
 
         async def on_llm_output(text: str):
-            print("🤖 LLM:", text)
+            if session_active:
+                print("🤖 LLM:", text)
 
         session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
-        session.on("conversation_item_added", lambda ev: log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content))
+        session.on(
+            "conversation_item_added",
+            lambda ev: asyncio.create_task(
+                log_to_file(
+                    ctx.room.name,
+                    "agent" if ev.item.role == "assistant" else "user",
+                    " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content
+                )
+                if session_active else None
+            )
+        )
 
-        # Create agent with instructions from behavior
+        # ----------------------------
+        # Create agent
+        # ----------------------------
         behavior = config.get("behavior", {})
         instructions_text = json.dumps(behavior, ensure_ascii=False)
         agent = DynamicAssistant(instructions=instructions_text)
 
         # Start session with agent
         await session.start(room=ctx.room, agent=agent)
-        await asyncio.sleep(0.5)  # ensure session is running
+        await asyncio.sleep(0.5)
 
         # Generate initial greeting / instructions
         await session.generate_reply(instructions=instructions_text)
-
         print("✅ Agent started successfully")
 
     except Exception as e:
