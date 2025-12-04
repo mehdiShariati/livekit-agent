@@ -19,13 +19,28 @@ class DynamicAssistant(Agent):
         super().__init__(instructions=instructions)
 
 # ----------------------------
-# Logging helpers
+# Async file writer queue
 # ----------------------------
-def log_to_file(room_name, role, message):
-    os.makedirs("chat_logs", exist_ok=True)
-    file_path = os.path.join("chat_logs", f"{room_name}.txt")
-    with open(file_path, "a", encoding="utf-8") as f:
-        f.write(f"{role}: {message}\n")
+file_write_queue = asyncio.Queue()
+
+async def file_writer():
+    while True:
+        room_name, role, message = await file_write_queue.get()
+        try:
+            os.makedirs("chat_logs", exist_ok=True)
+            file_path = os.path.join("chat_logs", f"{room_name}.txt")
+            with open(file_path, "a", encoding="utf-8") as f:
+                f.write(f"{role}: {message}\n")
+        except Exception as e:
+            print("❌ File write error:", e)
+        finally:
+            file_write_queue.task_done()
+
+# Start background writer task
+asyncio.create_task(file_writer())
+
+async def log_to_file(room_name, role, message):
+    await file_write_queue.put((room_name, role, message))
 
 # ----------------------------
 # Replace {{language}}
@@ -39,6 +54,15 @@ def replace_language(obj, target_language):
         return re.sub(r"\{\{\s*language\s*\}\}", target_language, obj)
     else:
         return obj
+
+# ----------------------------
+# LLM concurrency limiter
+# ----------------------------
+LLM_SEMAPHORE = asyncio.Semaphore(4)  # limit concurrent LLM calls
+
+async def safe_generate_reply(session, instructions):
+    async with LLM_SEMAPHORE:
+        return await session.generate_reply(instructions=instructions)
 
 # ----------------------------
 # Entrypoint
@@ -59,7 +83,6 @@ async def entrypoint(ctx: agents.JobContext):
     agent_type = metadata.get("agent_type", "tutor")
     target_language = metadata.get("language", "English")
     config = metadata.get("config", {})
-
     config = replace_language(config, target_language)
 
     await ctx.connect()
@@ -99,14 +122,15 @@ async def entrypoint(ctx: agents.JobContext):
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
 
-            session_active = False  # prevent logging after shutdown
+            session_active = False
 
             try:
-                await session.aclose()  # safely stop all agent tasks
+                await session.aclose()
             except Exception as e:
                 print("❌ Error stopping session:", e)
 
-            await asyncio.sleep(0.1)
+            await file_write_queue.join()  # ensure all logs are written
+
             try:
                 if ctx.room.isconnected():
                     await ctx.room.disconnect()
@@ -128,22 +152,13 @@ async def entrypoint(ctx: agents.JobContext):
                 if session_active:
                     print("🎙️ STT:", text)
 
-        async def on_llm_output(text: str):
-            if session_active:
-                print("🤖 LLM:", text)
-
-        session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
-
         async def handle_conversation_item(ev):
             if not session_active:
                 return
-            await asyncio.to_thread(
-                log_to_file,
-                ctx.room.name,
-                "agent" if ev.item.role == "assistant" else "user",
-                " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content
-            )
+            content = " ".join(ev.item.content) if isinstance(ev.item.content, list) else ev.item.content
+            await log_to_file(ctx.room.name, "agent" if ev.item.role == "assistant" else "user", content)
 
+        session.on("user_input_transcribed", lambda ev: asyncio.create_task(on_transcription(ev.transcript)))
         session.on("conversation_item_added", lambda ev: asyncio.create_task(handle_conversation_item(ev)))
 
         # ----------------------------
@@ -158,7 +173,7 @@ async def entrypoint(ctx: agents.JobContext):
         await asyncio.sleep(0.5)
 
         # Generate initial greeting / instructions
-        await session.generate_reply(instructions=instructions_text)
+        await safe_generate_reply(session, instructions_text)
         print("✅ Agent started successfully")
 
     except Exception as e:
