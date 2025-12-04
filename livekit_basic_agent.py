@@ -34,8 +34,10 @@ async def entrypoint(ctx: agents.JobContext):
 
     meta = {}
     if ctx.job.metadata:
-        try: meta = json.loads(ctx.job.metadata)
-        except: pass
+        try:
+            meta = json.loads(ctx.job.metadata)
+        except:
+            pass
 
     if meta.get("source") != "zabano":
         return
@@ -46,10 +48,13 @@ async def entrypoint(ctx: agents.JobContext):
 
     await ctx.connect()
 
-    if any(p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT for p in ctx.room.remote_participants.values()):
+    # Do not start if another agent is already connected
+    if any(p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+           for p in ctx.room.remote_participants.values()):
         print("Agent already running — skipping")
         return
 
+    # Select voice
     voice = random.choice(config.get("livekit", {}).get("voice_choices", ["nova"]))
 
     class CustomWhisperSTT(openai.STT):
@@ -66,14 +71,18 @@ async def entrypoint(ctx: agents.JobContext):
     )
 
     async def on_left(p):
-        if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT: return
+        if p.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            return
         await session.stop()
         await asyncio.sleep(0.25)
         await ctx.room.disconnect()
 
-    ctx.room.on("participant_disconnected", lambda p: asyncio.create_task(on_left(p)))
+    ctx.room.on("participant_disconnected",
+        lambda p: asyncio.create_task(on_left(p))
+    )
 
-    session.on("conversation_item_added",
+    session.on(
+        "conversation_item_added",
         lambda ev: log_to_file(
             ctx.room.name,
             "assistant" if ev.item.role == "assistant" else "user",
@@ -84,7 +93,9 @@ async def entrypoint(ctx: agents.JobContext):
     instructions = json.dumps(config.get("behavior", {}), ensure_ascii=False)
     agent = DynamicAssistant(instructions=instructions)
 
-    await session.start(ctx.room, agent)
+    # ✅ FIXED — only pass the agent
+    await session.start(agent=agent)
+
     await asyncio.sleep(0.25)
     await session.generate_reply(instructions=instructions)
 
