@@ -83,7 +83,7 @@ async def entrypoint(ctx: agents.JobContext):
             if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
                 return
             try:
-                await session.close()
+                await session.aclose()
             except Exception as e:
                 print("Error closing session:", e)
             try:
