@@ -5,14 +5,11 @@ import asyncpg
 from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from livekit import api, agents
 from livekit_basic_agent import entrypoint
-from fastapi.responses import StreamingResponse
 import io
-
-
 
 # Load environment variables
 load_dotenv(".env")
@@ -21,32 +18,13 @@ app = FastAPI(title="LiveKit Agent Manager")
 
 DB_POOL: asyncpg.pool.Pool | None = None
 
-async def init_db_pool():
-    global DB_POOL
-    if DB_POOL is None:
-        DB_POOL = await asyncpg.create_pool(
-            dsn=os.getenv("POSTGRES_URL"),
-            min_size=1,
-            max_size=5
-        )
-
-@app.on_event("startup")
-async def startup_event():
-    await init_db_pool()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global DB_POOL
-    if DB_POOL is not None:
-        await DB_POOL.close()
-
 # Track active dispatches per room with details
 active_dispatches = {}
 
 # Locks for preventing race conditions per room
 dispatch_locks = {}
 
-# Initialize the worker
+# Initialize the LiveKit worker
 worker = agents.Worker(
     agents.WorkerOptions(
         entrypoint_fnc=entrypoint,
@@ -56,6 +34,17 @@ worker = agents.Worker(
         api_secret=os.getenv("LIVEKIT_API_SECRET"),
     )
 )
+
+
+async def init_db_pool():
+    """Initialize the PostgreSQL connection pool."""
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = await asyncpg.create_pool(
+            dsn=os.getenv("POSTGRES_URL"),
+            min_size=1,
+            max_size=5
+        )
 
 
 async def get_room_lock(room_name: str):
@@ -73,56 +62,53 @@ class JobRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Start the LiveKit worker on app startup."""
-    print("🚀 Starting LiveKit Agent Worker...")
+    """Startup event: initialize DB pool and start LiveKit worker."""
+    print("🚀 Starting application...")
+
+    # Initialize database pool
+    await init_db_pool()
+    print("✅ Database pool initialized")
+
+    # Start LiveKit worker
     asyncio.create_task(worker.run())
-    print("✅ Worker started successfully")
+    print("✅ LiveKit worker started")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown event: close DB pool."""
+    global DB_POOL
+    if DB_POOL is not None:
+        await DB_POOL.close()
+        print("✅ Database pool closed")
 
 
 @app.post("/jobs")
 async def create_job(request: JobRequest):
-    """
-    Spawn a new agent in a specific room.
-
-    Args:
-        request: JobRequest with room_name, agent_type, and optional config
-
-    Returns:
-        dict with status, agent_type, room, and dispatch_id
-    """
+    """Spawn a new agent in a specific room."""
     timestamp = datetime.now().isoformat()
     print(f"🔔 [{timestamp}] Received job request:")
     print(f"   Room: {request.room_name}")
     print(f"   Agent Type: {request.agent_type}")
     print(f"   Config: {request.config}")
 
-    # Get lock for this room to prevent race conditions
     lock = await get_room_lock(request.room_name)
 
     async with lock:
-        # Check if agent already exists for this room
-
         try:
-            # Create LiveKit API client
             lkapi = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
                 api_key=os.getenv("LIVEKIT_API_KEY"),
                 api_secret=os.getenv("LIVEKIT_API_SECRET"),
             )
 
-            print(f"📤 [{timestamp}] Creating dispatch for room {request.room_name}...")
-
-            # Prepare metadata
             metadata_dict = {
                 "agent_type": request.agent_type,
                 "source": "zabano"
             }
-
-            # Add config if provided
             if request.config:
                 metadata_dict["config"] = request.config
 
-            # Create the agent dispatch
             dispatch = await lkapi.agent_dispatch.create_dispatch(
                 api.CreateAgentDispatchRequest(
                     agent_name="zabano_agent",
@@ -133,7 +119,6 @@ async def create_job(request: JobRequest):
 
             await lkapi.aclose()
 
-            # Track this dispatch
             active_dispatches[request.room_name] = {
                 'agent_type': request.agent_type,
                 'dispatch_id': dispatch.id,
@@ -141,11 +126,7 @@ async def create_job(request: JobRequest):
                 'config': request.config
             }
 
-            print(f"✅ [{timestamp}] Dispatch created successfully!")
-            print(f"   Dispatch ID: {dispatch.id}")
-            print(f"   Room: {request.room_name}")
-            print(f"   Agent Type: {request.agent_type}")
-
+            print(f"✅ [{timestamp}] Dispatch created successfully for room {request.room_name}")
             return {
                 "status": "started",
                 "agent_type": request.agent_type,
@@ -163,26 +144,13 @@ async def create_job(request: JobRequest):
 
 @app.delete("/jobs/{room_name}")
 async def remove_job(room_name: str):
-    """
-    Remove tracking for a room.
-    Call this when a room closes or agent should be removed.
-
-    Args:
-        room_name: Name of the room to remove tracking for
-
-    Returns:
-        dict with status and room name
-    """
+    """Remove tracking for a room."""
     timestamp = datetime.now().isoformat()
 
     if room_name in active_dispatches:
-        dispatch_info = active_dispatches[room_name]
-        del active_dispatches[room_name]
+        dispatch_info = active_dispatches.pop(room_name)
 
         print(f"🗑️ [{timestamp}] Removed dispatch tracking for room: {room_name}")
-        print(f"   Agent Type: {dispatch_info['agent_type']}")
-        print(f"   Dispatch ID: {dispatch_info['dispatch_id']}")
-
         return {
             "status": "removed",
             "room": room_name,
@@ -199,12 +167,7 @@ async def remove_job(room_name: str):
 
 @app.get("/jobs")
 async def list_jobs():
-    """
-    List all active job dispatches.
-
-    Returns:
-        dict with active_dispatches and count
-    """
+    """List all active job dispatches."""
     return {
         "active_dispatches": active_dispatches,
         "count": len(active_dispatches),
@@ -214,15 +177,7 @@ async def list_jobs():
 
 @app.get("/jobs/{room_name}")
 async def get_job(room_name: str):
-    """
-    Get details of a specific room's agent dispatch.
-
-    Args:
-        room_name: Name of the room
-
-    Returns:
-        dict with dispatch details or 404
-    """
+    """Get details of a specific room's agent dispatch."""
     if room_name in active_dispatches:
         return {
             "status": "active",
@@ -230,10 +185,7 @@ async def get_job(room_name: str):
             "dispatch": active_dispatches[room_name]
         }
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"No active dispatch found for room {room_name}"
-    )
+    raise HTTPException(status_code=404, detail=f"No active dispatch found for room {room_name}")
 
 
 @app.get("/health")
@@ -248,6 +200,7 @@ async def health_check():
 
 @app.get("/logs/{room_name}")
 async def get_chat_log(room_name: str):
+    """Return chat logs for a room as a downloadable text file."""
     global DB_POOL
     if DB_POOL is None:
         raise HTTPException(status_code=500, detail="Database pool is not initialized")
