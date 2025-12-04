@@ -19,7 +19,7 @@ load_dotenv(".env")
 
 app = FastAPI(title="LiveKit Agent Manager")
 
-DB_POOL = None
+DB_POOL: asyncpg.pool.Pool | None = None
 
 async def init_db_pool():
     global DB_POOL
@@ -33,6 +33,12 @@ async def init_db_pool():
 @app.on_event("startup")
 async def startup_event():
     await init_db_pool()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global DB_POOL
+    if DB_POOL is not None:
+        await DB_POOL.close()
 
 # Track active dispatches per room with details
 active_dispatches = {}
@@ -257,12 +263,8 @@ async def get_chat_log(room_name: str):
         records = await conn.fetch(query, room_name)
 
     if not records:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No logs found for room '{room_name}'"
-        )
+        raise HTTPException(status_code=404, detail=f"No logs found for room '{room_name}'")
 
-    # Build the text content
     content = "\n".join(f"{r['role']}: {r['message']}" for r in records)
     buffer = io.BytesIO(content.encode("utf-8"))
 
