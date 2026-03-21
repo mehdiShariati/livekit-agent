@@ -8,7 +8,8 @@ from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero
-
+from livekit.plugins.openai import realtime
+from livekit.plugins.openai.realtime import TurnDetection
 load_dotenv(".env")
 
 
@@ -72,11 +73,18 @@ async def entrypoint(ctx: agents.JobContext):
                 return await super().transcribe(*args, **kwargs)
 
         session = AgentSession(
-            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
-            llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
-            tts=openai.TTS(voice=voice),
-            vad=silero.VAD.load(),
-        )
+    stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
+    llm=realtime.RealtimeModel(
+        turn_detection=TurnDetection(
+            type="semantic_vad",
+            eagerness="medium",
+            create_response=True,
+            interrupt_response=True,
+        ),
+    ),
+    tts=openai.TTS(voice=voice),
+    vad=silero.VAD.load(),
+)
 
         async def handle_user_left(participant):
             print(f"👋 Participant left: {participant.identity}")
