@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero, simli
+from livekit.plugins.openai import realtime
+
 
 # Load environment variables
 load_dotenv(".env")
@@ -126,7 +128,13 @@ async def entrypoint(ctx: agents.JobContext):
         # Setup session components
         session = AgentSession(
             stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
-            llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
+            llm=realtime.RealtimeModel(
+        turn_detection=TurnDetection(
+            type="semantic_vad",
+            eagerness="medium",
+            create_response=True,
+            interrupt_response=True,
+        ),
             tts=openai.TTS(voice=voice),
             vad=silero.VAD.load(),
         )
