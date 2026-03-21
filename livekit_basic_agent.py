@@ -7,10 +7,11 @@ from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero, simli
 from livekit.plugins.openai import realtime
-
+from livekit.plugins.openai.realtime import TurnDetection
 
 # Load environment variables
 load_dotenv(".env")
+ 
 
 # ---------------------------------------------
 # 🧱 Agent Template Configuration
@@ -127,17 +128,18 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Setup session components
         session = AgentSession(
-            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
-            llm=realtime.RealtimeModel(
+    stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
+    llm=realtime.RealtimeModel(
         turn_detection=TurnDetection(
             type="semantic_vad",
             eagerness="medium",
             create_response=True,
             interrupt_response=True,
         ),
-            tts=openai.TTS(voice=voice),
-            vad=silero.VAD.load(),
-        )
+    ),
+    tts=openai.TTS(voice=voice),
+    vad=silero.VAD.load(),
+)
 
         # avatar = simli.AvatarSession(
         #     simli_config=simli.SimliConfig(
