@@ -126,7 +126,7 @@ async def startup_event():
     worker_server = AgentServer()
     worker_server.rtc_session(
         entrypoint,
-        agent_name="rockonlearn_agent",
+        agent_name="zabano_agent",
     )
 
     asyncio.create_task(worker_server.run())
@@ -160,7 +160,7 @@ def build_dispatch_metadata(request: JobRequest) -> dict[str, Any]:
     transcript_room_name = (request.transcript_room_name or request.room_name).strip()
 
     return {
-        "source": "rockonlearn",
+        "source": "zabano",
         "agent_type": request.agent_type.strip() or "tutor",
         "transcript_room_name": transcript_room_name,
         "config": request.config.model_dump(),
@@ -226,7 +226,7 @@ async def create_job(request: JobRequest):
 
         dispatch = await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
-                agent_name="rockonlearn_agent",
+                agent_name="zabano_agent",
                 room=request.room_name,
                 metadata=json.dumps(metadata_dict, ensure_ascii=False),
             )

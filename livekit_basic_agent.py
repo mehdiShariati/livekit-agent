@@ -14,7 +14,7 @@ from livekit.plugins import openai, silero
 
 load_dotenv(".env")
 
-logger = logging.getLogger("rockonlearn.agent")
+logger = logging.getLogger("zabano.agent")
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
