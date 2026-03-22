@@ -535,5 +535,5 @@ async def entrypoint(ctx: agents.JobContext):
         logger.info("agent_cleanup_done room=%s", room_name)
 
 
-if __name__ == "__main__":
-    agents.cli.run_app(entrypoint)
+# if __name__ == "__main__":
+#     agents.cli.run_app(entrypoint)
