@@ -11,8 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from livekit import api
-from livekit.agents import WorkerOptions
-from livekit.agents.worker import AgentServer
+from livekit.agents import AgentServer
 
 from livekit_basic_agent import entrypoint
 
@@ -20,10 +19,10 @@ load_dotenv(".env")
 
 app = FastAPI(title="LiveKit Agent Manager")
 
-DB_POOL: asyncpg.pool.Pool | None = None
+DB_POOL = None
 active_dispatches = {}
 dispatch_locks = {}
-worker_server: AgentServer | None = None
+worker_server = None
 
 
 async def init_db_pool():
@@ -57,14 +56,12 @@ async def startup_event():
     await init_db_pool()
     print("✅ Database pool initialized")
 
-    worker_server = AgentServer(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="zabano_agent",
-            ws_url=os.getenv("LIVEKIT_URL"),
-            api_key=os.getenv("LIVEKIT_API_KEY"),
-            api_secret=os.getenv("LIVEKIT_API_SECRET"),
-        )
+    # Current LiveKit 1.x style:
+    # create AgentServer directly, then register the RTC session entrypoint.
+    worker_server = AgentServer()
+    worker_server.rtc_session(
+        entrypoint,
+        agent_name="zabano_agent",
     )
 
     asyncio.create_task(worker_server.run())
@@ -83,8 +80,11 @@ async def shutdown_event():
             print(f"⚠️ Error closing LiveKit worker: {e}")
 
     if DB_POOL is not None:
-        await DB_POOL.close()
-        print("✅ Database pool closed")
+        try:
+            await DB_POOL.close()
+            print("✅ Database pool closed")
+        except Exception as e:
+            print(f"⚠️ Error closing DB pool: {e}")
 
 
 @app.post("/jobs")
@@ -98,6 +98,7 @@ async def create_job(request: JobRequest):
     lock = await get_room_lock(request.room_name)
 
     async with lock:
+        lkapi = None
         try:
             lkapi = api.LiveKitAPI(
                 url=os.getenv("LIVEKIT_URL"),
@@ -120,8 +121,6 @@ async def create_job(request: JobRequest):
                 )
             )
 
-            await lkapi.aclose()
-
             active_dispatches[request.room_name] = {
                 "agent_type": request.agent_type,
                 "dispatch_id": dispatch.id,
@@ -143,6 +142,10 @@ async def create_job(request: JobRequest):
             import traceback
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
+
+        finally:
+            if lkapi is not None:
+                await lkapi.aclose()
 
 
 @app.delete("/jobs/{room_name}")
@@ -200,6 +203,7 @@ async def health_check():
 @app.get("/logs/{room_name}")
 async def get_chat_log(room_name: str):
     global DB_POOL
+
     if DB_POOL is None:
         raise HTTPException(status_code=500, detail="Database pool is not initialized")
 
