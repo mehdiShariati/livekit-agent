@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -41,83 +42,6 @@ VOICE_MAP = {
 }
 
 _VAD_INSTANCE = None
-_DB_POOL: Optional[asyncpg.Pool] = None
-_DB_POOL_LOCK = asyncio.Lock()
-
-
-async def get_db_pool() -> asyncpg.Pool:
-    global _DB_POOL
-    if _DB_POOL is None:
-        async with _DB_POOL_LOCK:
-            if _DB_POOL is None:
-                postgres_url = os.getenv("POSTGRES_URL")
-                if not postgres_url:
-                    raise RuntimeError("POSTGRES_URL is not set")
-                _DB_POOL = await asyncpg.create_pool(
-                    dsn=postgres_url,
-                    min_size=1,
-                    max_size=10,
-                )
-    return _DB_POOL
-
-
-class PgRoomLock:
-    """
-    Cross-process lock using PostgreSQL advisory locks.
-    This is atomic and prevents two workers from owning the same room.
-    """
-
-    def __init__(self, room_name: str):
-        self.room_name = room_name
-        self.conn: Optional[asyncpg.Connection] = None
-        self.lock_acquired = False
-
-    def _lock_key(self) -> int:
-        # Stable enough integer key for pg advisory lock
-        return abs(hash(self.room_name)) % (2**31)
-
-    async def acquire(self) -> bool:
-        pool = await get_db_pool()
-        self.conn = await pool.acquire()
-
-        try:
-            result = await self.conn.fetchval(
-                "SELECT pg_try_advisory_lock($1)",
-                self._lock_key(),
-            )
-            if result:
-                self.lock_acquired = True
-                logger.info("pg_advisory_lock_acquired room=%s key=%s", self.room_name, self._lock_key())
-                return True
-
-            logger.warning("pg_advisory_lock_denied room=%s key=%s", self.room_name, self._lock_key())
-            return False
-
-        except Exception:
-            logger.exception("pg_advisory_lock_failed room=%s", self.room_name)
-            return False
-
-    async def release(self) -> None:
-        if not self.conn:
-            return
-
-        try:
-            if self.lock_acquired:
-                await self.conn.execute(
-                    "SELECT pg_advisory_unlock($1)",
-                    self._lock_key(),
-                )
-                logger.info("pg_advisory_lock_released room=%s key=%s", self.room_name, self._lock_key())
-        except Exception:
-            logger.exception("pg_advisory_unlock_failed room=%s", self.room_name)
-        finally:
-            try:
-                pool = await get_db_pool()
-                await pool.release(self.conn)
-            except Exception:
-                logger.exception("pg_lock_connection_release_failed room=%s", self.room_name)
-            self.conn = None
-            self.lock_acquired = False
 
 
 def clean_text(value: Any, default: str = "") -> str:
@@ -289,6 +213,68 @@ def get_vad():
     return _VAD_INSTANCE
 
 
+def stable_lock_key(room_name: str) -> int:
+    digest = hashlib.sha256(room_name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) % (2**63 - 1)
+
+
+class PgRoomLock:
+    """
+    Dedicated connection + advisory lock.
+    Do NOT use a pool connection for this lock.
+    Advisory locks are session-scoped, so we keep the same connection
+    open for the entire lifetime of the agent session.
+    """
+
+    def __init__(self, room_name: str):
+        self.room_name = room_name
+        self.key = stable_lock_key(room_name)
+        self.conn: Optional[asyncpg.Connection] = None
+        self.lock_acquired = False
+
+    async def acquire(self) -> bool:
+        postgres_url = os.getenv("POSTGRES_URL")
+        if not postgres_url:
+            raise RuntimeError("POSTGRES_URL is not set")
+
+        self.conn = await asyncpg.connect(dsn=postgres_url)
+
+        try:
+            result = await self.conn.fetchval(
+                "SELECT pg_try_advisory_lock($1::bigint)",
+                self.key,
+            )
+            if result is True:
+                self.lock_acquired = True
+                logger.info("pg_advisory_lock_acquired room=%s key=%s", self.room_name, self.key)
+                return True
+
+            logger.warning("pg_advisory_lock_denied room=%s key=%s", self.room_name, self.key)
+            return False
+        except Exception:
+            logger.exception("pg_advisory_lock_failed room=%s", self.room_name)
+            return False
+
+    async def release(self) -> None:
+        if self.conn is None:
+            return
+
+        try:
+            if self.lock_acquired:
+                await self.conn.execute(
+                    "SELECT pg_advisory_unlock($1::bigint)",
+                    self.key,
+                )
+                logger.info("pg_advisory_lock_released room=%s key=%s", self.room_name, self.key)
+        except Exception:
+            logger.exception("pg_advisory_unlock_failed room=%s", self.room_name)
+        finally:
+            with contextlib.suppress(Exception):
+                await self.conn.close()
+            self.conn = None
+            self.lock_acquired = False
+
+
 def count_remote_agents(room: rtc.Room) -> int:
     count = 0
     for participant in room.remote_participants.values():
@@ -456,13 +442,11 @@ async def entrypoint(ctx: agents.JobContext):
         if not isinstance(config, dict):
             config = {}
 
-        system_prompt = build_system_prompt(agent_type, config)
-        opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
-        voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
-
-        await ctx.connect()
-        room_name = getattr(ctx.room, "name", "unknown")
-        logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
+        # IMPORTANT: get room key from metadata BEFORE ctx.connect()
+        room_name = clean_text(
+            metadata.get("transcript_room_name"),
+            clean_text(getattr(ctx.job, "room", None), "unknown-room"),
+        )
 
         room_lock = PgRoomLock(room_name)
         locked = await room_lock.acquire()
@@ -470,6 +454,15 @@ async def entrypoint(ctx: agents.JobContext):
             logger.warning("duplicate_agent_pg_lock room=%s", room_name)
             ctx.shutdown("duplicate_agent_pg_lock")
             return
+
+        system_prompt = build_system_prompt(agent_type, config)
+        opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
+        voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
+
+        # Only the lock owner reaches here
+        await ctx.connect()
+        room_name = getattr(ctx.room, "name", room_name)
+        logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
 
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
         if stale_count > 0:
