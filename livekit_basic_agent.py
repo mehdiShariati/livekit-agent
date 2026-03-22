@@ -1,132 +1,79 @@
 import json
-import os
 import random
+import os
 import asyncio
-import asyncpg
-
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
-from livekit.plugins import openai, silero
+from livekit.plugins import openai, silero, simli
 
+# Load environment variables
 load_dotenv(".env")
 
-DB_POOL = None
-DB_POOL_LOCK = asyncio.Lock()
+# ---------------------------------------------
+# 🧱 Agent Template Configuration
+# ---------------------------------------------
+AGENT_TYPES = {
+    "onboarding": {
+        "instructions": """
+        You are a friendly onboarding guide who helps new users understand how to use the zabano.com platform.
+        Speak in Persian.
+        Keep responses short, warm, and motivating.
+        """,
+        "voice_choices": ["nova"],
+        "greeting": "سلام! به زبانو خوش آمدید. چطور می‌تونم کمکتون کنم؟"
+    },
+    "assessment": {
+        "instructions": """
+        You are an English proficiency assessor.
+        Conduct a short conversation to evaluate user's English speaking and comprehension.
+        Ask open questions, rate them privately (don't show scores to user).
+        Speak partly in English, partly in Persian.
+        """,
+        "voice_choices": ["coral", "verse"],
+        "greeting": "Hello! سلام! Ready to test your English? آماده‌اید؟"
+    },
+    "tutor": {
+        "instructions": """
+        You are an expert English tutor for Persian speakers.
+        Always explain grammar in Persian and show clear English examples.
+        Be kind, interactive, and patient.
+        """,
+        "voice_choices": ["nova", "coral"],
+        "greeting": "سلام! من معلم انگلیسی شما هستم. بیایید شروع کنیم!"
+    },
+}
 
 
-async def init_db_pool():
-    global DB_POOL
-    if DB_POOL is None:
-        async with DB_POOL_LOCK:
-            if DB_POOL is None:
-                DB_POOL = await asyncpg.create_pool(
-                    dsn=os.getenv("POSTGRES_URL"),
-                    min_size=1,
-                    max_size=5,
-                )
-
-
-async def log_to_postgres(room_name: str, role: str, message: str):
-    try:
-        if not message or not str(message).strip():
-            return
-
-        await init_db_pool()
-        query = """
-            INSERT INTO chat_logs (room_name, role, message, created_at)
-            VALUES ($1, $2, $3, NOW())
-        """
-        async with DB_POOL.acquire() as conn:
-            await conn.execute(query, room_name, role, str(message).strip())
-    except Exception as e:
-        print(f"DB log error: {e}")
-
-
-def normalize_content(content) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, list):
-        return " ".join(str(item) for item in content).strip()
-    return str(content).strip()
-
-
-def build_instructions(agent_type: str, config_override: dict | None = None) -> str:
-    base_map = {
-        "onboarding": """
-You are a friendly onboarding guide for zabano.com.
-Speak in Persian.
-Keep responses short, warm, and motivating.
-""".strip(),
-        "assessment": """
-You are an English proficiency assessor.
-Conduct a short conversation to evaluate the user's English speaking and comprehension.
-Ask open questions and keep ratings private.
-Speak partly in English and partly in Persian.
-""".strip(),
-        "tutor": """
-You are an expert English tutor for Persian speakers.
-Explain when needed in Persian, but keep the conversation natural.
-Be kind, interactive, patient, and brief.
-""".strip(),
-    }
-
-    instructions = base_map.get(agent_type, base_map["tutor"])
-
-    if not config_override:
-        return instructions
-
-    behavior = config_override.get("behavior", {})
-    if not behavior:
-        return instructions
-
-    tone = behavior.get("tone")
-    rules = behavior.get("rules", {})
-    user_level = rules.get("user_level")
-    topic_focus = rules.get("topic_focus", {})
-    topic = topic_focus.get("topic")
-    topic_description = topic_focus.get("description")
-    conciseness = rules.get("conciseness")
-    interaction_style = rules.get("interaction_style")
-
-    extra_lines = []
-
-    if tone:
-        extra_lines.append(f"Tone: {tone}")
-    if user_level:
-        extra_lines.append(f"User level: {user_level}")
-    if conciseness:
-        extra_lines.append(conciseness)
-    if topic:
-        extra_lines.append(f"Topic focus: {topic}")
-    if topic_description:
-        extra_lines.append(topic_description)
-    if interaction_style:
-        extra_lines.append(interaction_style)
-
-    if extra_lines:
-        instructions += "\n\nAdditional behavior:\n" + "\n".join(f"- {line}" for line in extra_lines)
-
-    return instructions
-
-
+# ---------------------------------------------
+# 👩‍🏫 Dynamic Assistant class
+# ---------------------------------------------
 class DynamicAssistant(Agent):
-    def __init__(self, instructions: str):
-        super().__init__(instructions=instructions)
+    def __init__(self, agent_type="tutor"):
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
+        super().__init__(instructions=config["instructions"])
+        self.agent_type = agent_type
 
 
+# ---------------------------------------------
+# 🚀 Entrypoint
+# ---------------------------------------------
 async def entrypoint(ctx: agents.JobContext):
-    metadata = {}
+    """Main entrypoint for the LiveKit agent."""
 
-    if hasattr(ctx.job, "metadata") and ctx.job.metadata:
+    # Parse metadata
+    metadata = {}
+    if hasattr(ctx.job, 'metadata') and ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
             print(f"📦 Metadata: {metadata}")
         except Exception as e:
             print(f"❌ Failed to parse metadata: {e}")
 
+    # Validate this is a zabano job
     if metadata.get("source") != "zabano":
         if not metadata:
+            # Empty metadata - use default for testing
             print("⚠️ No metadata provided, using default tutor agent")
             agent_type = "tutor"
         else:
@@ -135,93 +82,73 @@ async def entrypoint(ctx: agents.JobContext):
     else:
         agent_type = metadata.get("agent_type", "tutor")
 
-    config_override = metadata.get("config", {}) or {}
+    instruction = metadata.get('config')
+    behavior = ""
+    if instruction:
+        behavior = instruction.get('behavior')
 
+    # Connect to room
     await ctx.connect()
+
+    # Wait a bit for other agents to appear (handle race condition)
     await asyncio.sleep(0.5)
 
-    print(f"✅ Connected to room: {ctx.room.name}")
-    print(f"👥 Remote participants: {list(ctx.room.remote_participants.keys())}")
-
+    # Check if there are already agents in the room
     participants = ctx.room.remote_participants
-    agent_count = sum(
-        1
-        for participant in participants.values()
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
-    )
+    agent_count = 0
+    print(participants)
+    for participant in participants.values():
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            agent_count += 1
+            print(f"⚠️ Found existing agent in room: {participant.identity}")
 
     if agent_count > 0:
         print(f"⚠️ {agent_count} agent(s) already in room {ctx.room.name}, skipping")
         return
 
+    print(f"✅ No existing agent found, proceeding to start {agent_type} agent")
+
     try:
-        voice_choices = config_override.get("livekit", {}).get("voice_choices", ["marin", "nova"])
-        voice = random.choice(voice_choices)
+        # Get configuration
+        config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
+        voice = random.choice(config["voice_choices"])
 
-        instructions_text = build_instructions(agent_type, config_override)
-        agent = DynamicAssistant(instructions=instructions_text)
+        print(f"✅ Starting {agent_type} agent in room {ctx.room.name} with voice {voice}")
 
+        # Custom STT to force transcription (not translation)
+        class CustomWhisperSTT(openai.STT):
+            async def transcribe(self, *args, **kwargs):
+                # Force Whisper to transcribe (not translate)
+                kwargs["task"] = "transcribe"  # 👈 critical flag
+                kwargs.pop("translate", False)  # remove translation if passed accidentally
+                return await super().transcribe(*args, **kwargs)
+
+        # Setup session components
         session = AgentSession(
-            llm=openai.realtime.RealtimeModel(
-                model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-1.5"),
-                voice=voice,
-            ),
+            stt=CustomWhisperSTT(model="gpt-4o-mini-transcribe"),
+            llm=openai.LLM(model=os.getenv("LLM_CHOICE", "gpt-4o-mini")),
+            tts=openai.TTS(voice=voice),
             vad=silero.VAD.load(),
         )
 
-        async def handle_user_left(participant):
-            print(f"👋 Participant left: {participant.identity}")
-            if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
-                return
+        # avatar = simli.AvatarSession(
+        #     simli_config=simli.SimliConfig(
+        #         api_key=os.getenv("SIMLI_API_KEY"),
+        #         face_id="14de6eb1-0ea6-4fde-9522-8552ce691cb6",
+        #         # ID of the Simli face to use for your avatar. See "Face setup" for details.
+        #     ),
+        # )
 
-            try:
-                await session.aclose()
-            except Exception as e:
-                print(f"Error closing session: {e}")
+        # Start the avatar and wait for it to join
+        # await avatar.start(session, room=ctx.room)
 
-            try:
-                await ctx.room.disconnect()
-            except Exception as e:
-                print(f"Error disconnecting room: {e}")
+        # Start the session
+        await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
+        greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
 
-        async def handle_transcript(transcript: str):
-            transcript = (transcript or "").strip()
-            print(f"🎙️ STT: {transcript}")
-            if transcript:
-                await log_to_postgres(ctx.room.name, "user", transcript)
-
-        async def handle_conversation_item(ev):
-            if getattr(ev.item, "role", "") != "assistant":
-                return
-
-            content = normalize_content(getattr(ev.item, "content", ""))
-            if content:
-                await log_to_postgres(ctx.room.name, "assistant", content)
-
-        ctx.room.on(
-            "participant_disconnected",
-            lambda p: asyncio.create_task(handle_user_left(p)),
-        )
-
-        session.on(
-            "user_input_transcribed",
-            lambda ev: asyncio.create_task(handle_transcript(ev.transcript)),
-        )
-
-        session.on(
-            "conversation_item_added",
-            lambda ev: asyncio.create_task(handle_conversation_item(ev)),
-        )
-
-        print(f"🚀 Starting {agent_type} agent in room {ctx.room.name} with voice {voice}")
-        await session.start(room=ctx.room, agent=agent)
-
-        greeting_map = {
-            "onboarding": "سلام! به زبانو خوش آمدید. چطور می‌تونم کمکتون کنم؟",
-            "assessment": "Hello! سلام! Ready to test your English?",
-            "tutor": "سلام! من معلم انگلیسی شما هستم. بیایید شروع کنیم!",
-        }
-        greeting = greeting_map.get(agent_type, greeting_map["tutor"])
+        # Send greeting
+        if behavior:
+            greeting = json.dumps(behavior)  # Don't stringify it, use it directly
 
         await session.generate_reply(instructions=greeting)
 
