@@ -56,67 +56,68 @@ async def get_db_pool() -> asyncpg.Pool:
                 _DB_POOL = await asyncpg.create_pool(
                     dsn=postgres_url,
                     min_size=1,
-                    max_size=5,
+                    max_size=10,
                 )
     return _DB_POOL
 
 
-async def ensure_agent_lock_table() -> None:
-    pool = await get_db_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS agent_room_locks (
-                room_name TEXT PRIMARY KEY,
-                owner_id TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-
-
 class PgRoomLock:
-    def __init__(self, room_name: str, owner_id: str):
+    """
+    Cross-process lock using PostgreSQL advisory locks.
+    This is atomic and prevents two workers from owning the same room.
+    """
+
+    def __init__(self, room_name: str):
         self.room_name = room_name
-        self.owner_id = owner_id
-        self.acquired = False
+        self.conn: Optional[asyncpg.Connection] = None
+        self.lock_acquired = False
+
+    def _lock_key(self) -> int:
+        # Stable enough integer key for pg advisory lock
+        return abs(hash(self.room_name)) % (2**31)
 
     async def acquire(self) -> bool:
         pool = await get_db_pool()
-        async with pool.acquire() as conn:
-            try:
-                await conn.execute("""
-                    INSERT INTO agent_room_locks (room_name, owner_id, created_at, updated_at)
-                    VALUES ($1, $2, NOW(), NOW())
-                    ON CONFLICT DO NOTHING
-                """, self.room_name, self.owner_id)
+        self.conn = await pool.acquire()
 
-                row = await conn.fetchrow("""
-                    SELECT owner_id
-                    FROM agent_room_locks
-                    WHERE room_name = $1
-                """, self.room_name)
+        try:
+            result = await self.conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)",
+                self._lock_key(),
+            )
+            if result:
+                self.lock_acquired = True
+                logger.info("pg_advisory_lock_acquired room=%s key=%s", self.room_name, self._lock_key())
+                return True
 
-                if row and row["owner_id"] == self.owner_id:
-                    self.acquired = True
-                    return True
-                return False
-            except Exception:
-                logger.exception("pg_lock_acquire_failed room=%s owner=%s", self.room_name, self.owner_id)
-                return False
+            logger.warning("pg_advisory_lock_denied room=%s key=%s", self.room_name, self._lock_key())
+            return False
+
+        except Exception:
+            logger.exception("pg_advisory_lock_failed room=%s", self.room_name)
+            return False
 
     async def release(self) -> None:
-        if not self.acquired:
+        if not self.conn:
             return
 
-        pool = await get_db_pool()
-        async with pool.acquire() as conn:
+        try:
+            if self.lock_acquired:
+                await self.conn.execute(
+                    "SELECT pg_advisory_unlock($1)",
+                    self._lock_key(),
+                )
+                logger.info("pg_advisory_lock_released room=%s key=%s", self.room_name, self._lock_key())
+        except Exception:
+            logger.exception("pg_advisory_unlock_failed room=%s", self.room_name)
+        finally:
             try:
-                await conn.execute("""
-                    DELETE FROM agent_room_locks
-                    WHERE room_name = $1 AND owner_id = $2
-                """, self.room_name, self.owner_id)
+                pool = await get_db_pool()
+                await pool.release(self.conn)
             except Exception:
-                logger.exception("pg_lock_release_failed room=%s owner=%s", self.room_name, self.owner_id)
+                logger.exception("pg_lock_connection_release_failed room=%s", self.room_name)
+            self.conn = None
+            self.lock_acquired = False
 
 
 def clean_text(value: Any, default: str = "") -> str:
@@ -434,11 +435,8 @@ async def entrypoint(ctx: agents.JobContext):
     runtime = ReplyOrchestrator()
     room_name = "unknown"
     room_lock: Optional[PgRoomLock] = None
-    owner_id = f"{os.getpid()}:{time.time_ns()}"
 
     try:
-        await ensure_agent_lock_table()
-
         if hasattr(ctx.job, "metadata") and ctx.job.metadata:
             try:
                 metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
@@ -466,18 +464,16 @@ async def entrypoint(ctx: agents.JobContext):
         room_name = getattr(ctx.room, "name", "unknown")
         logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
 
-        # Strong cross-process lock
-        room_lock = PgRoomLock(room_name=room_name, owner_id=owner_id)
+        room_lock = PgRoomLock(room_name)
         locked = await room_lock.acquire()
         if not locked:
-            logger.warning("postgres_room_lock_denied room=%s owner=%s", room_name, owner_id)
+            logger.warning("duplicate_agent_pg_lock room=%s", room_name)
             ctx.shutdown("duplicate_agent_pg_lock")
             return
 
-        # Soft guards remain useful
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
         if stale_count > 0:
-            logger.warning("room=%s still has %s active agent(s); skipping duplicate worker", room_name, stale_count)
+            logger.warning("room=%s still has %s active agent(s); shutting down duplicate", room_name, stale_count)
             ctx.shutdown("room_already_has_agent")
             return
 
