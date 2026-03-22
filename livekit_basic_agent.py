@@ -55,6 +55,33 @@ class DynamicAssistant(Agent):
         self.agent_type = agent_type
 
 
+def _count_remote_agents(room: rtc.Room) -> int:
+    n = 0
+    for participant in room.remote_participants.values():
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            n += 1
+    return n
+
+
+async def _wait_for_stale_agents_to_leave(
+    room: rtc.Room, *, max_wait_s: float = 3.5, poll_s: float = 0.35
+) -> int:
+    """
+    After dispatch, LiveKit may still list a disconnecting agent briefly, or a resume may race
+    with the previous session. If count is 0 immediately, proceed. If agents are present, poll
+    until they clear or timeout; only skip starting when agents remain after the wait.
+    """
+    count = _count_remote_agents(room)
+    if count == 0:
+        return 0
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max_wait_s
+    while count > 0 and loop.time() < deadline:
+        await asyncio.sleep(poll_s)
+        count = _count_remote_agents(room)
+    return count
+
+
 # ---------------------------------------------
 # 🚀 Entrypoint
 # ---------------------------------------------
@@ -90,23 +117,16 @@ async def entrypoint(ctx: agents.JobContext):
     # Connect to room
     await ctx.connect()
 
-    # Wait a bit for other agents to appear (handle race condition)
-    await asyncio.sleep(0.5)
-
-    # Check if there are already agents in the room
-    participants = ctx.room.remote_participants
-    agent_count = 0
-    print(participants)
-    for participant in participants.values():
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
-            agent_count += 1
-            print(f"⚠️ Found existing agent in room: {participant.identity}")
-
+    agent_count = await _wait_for_stale_agents_to_leave(ctx.room)
     if agent_count > 0:
-        print(f"⚠️ {agent_count} agent(s) already in room {ctx.room.name}, skipping")
+        print(
+            f"⚠️ {agent_count} agent(s) still in room {ctx.room.name} after stale wait — "
+            "skipping duplicate worker"
+        )
+        ctx.shutdown("room_already_has_agent")
         return
 
-    print(f"✅ No existing agent found, proceeding to start {agent_type} agent")
+    print(f"✅ No active agent in room {ctx.room.name}, proceeding to start {agent_type} agent")
 
     try:
         # Get configuration
