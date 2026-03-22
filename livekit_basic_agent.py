@@ -120,7 +120,7 @@ async def entrypoint(ctx: agents.JobContext):
         agent_type = metadata.get("agent_type", "tutor")
 
     instruction = metadata.get('config')
-    behavior = ""
+    behavior = "" 
     if instruction:
         behavior = instruction.get('behavior')
 
