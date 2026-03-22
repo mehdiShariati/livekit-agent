@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import random
-from typing import Any
+import time
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from livekit import agents, rtc
@@ -13,16 +15,20 @@ from livekit.plugins import openai, silero
 load_dotenv(".env")
 
 logger = logging.getLogger("rockonlearn.agent")
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-
-# ============================================================
-# Static application policy
-# ============================================================
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 DEFAULT_AGENT_TYPE = "tutor"
 DEFAULT_LLM = os.getenv("LLM_CHOICE", "gpt-4o-mini")
-DEFAULT_STT_MODEL = "gpt-4o-mini-transcribe"
+DEFAULT_STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
+
+REPLY_QUEUE_MAXSIZE = int(os.getenv("REPLY_QUEUE_MAXSIZE", "8"))
+MIN_REPLY_GAP_SECONDS = float(os.getenv("MIN_REPLY_GAP_SECONDS", "1.25"))
+REPLY_TIMEOUT_SECONDS = float(os.getenv("REPLY_TIMEOUT_SECONDS", "25"))
+STALE_AGENT_WAIT_SECONDS = float(os.getenv("STALE_AGENT_WAIT_SECONDS", "3.5"))
+STALE_AGENT_POLL_SECONDS = float(os.getenv("STALE_AGENT_POLL_SECONDS", "0.35"))
 
 VOICE_MAP = {
     "tutor": ["nova", "coral"],
@@ -146,13 +152,8 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
         "If there was a previous session, continue naturally. Otherwise start simply.",
     )
 
-    role_text = static_agent_role(agent_type)
-    teaching_policy_text = static_teaching_policy(agent_type)
-    language_policy_text = language_policy(native_language, target_language, learner_level)
-    safety_rules = static_safety_rules()
-
     return f"""
-{role_text}
+{static_agent_role(agent_type)}
 
 Teach naturally in real-time spoken conversation.
 
@@ -169,10 +170,10 @@ Lesson context:
 - Goal: {lesson_goal}
 
 Language policy:
-{language_policy_text}
+{language_policy(native_language, target_language, learner_level)}
 
 Teaching policy:
-{teaching_policy_text}
+{static_teaching_policy(agent_type)}
 
 Progress summary:
 {progress_summary}
@@ -184,7 +185,7 @@ Resume behavior:
 {resume_instruction}
 
 Safety and operating rules:
-{safety_rules}
+{static_safety_rules()}
 """.strip()
 
 
@@ -218,8 +219,8 @@ def count_remote_agents(room: rtc.Room) -> int:
 async def wait_for_stale_agents_to_leave(
     room: rtc.Room,
     *,
-    max_wait_s: float = 3.5,
-    poll_s: float = 0.35,
+    max_wait_s: float = STALE_AGENT_WAIT_SECONDS,
+    poll_s: float = STALE_AGENT_POLL_SECONDS,
 ) -> int:
     count = count_remote_agents(room)
     if count == 0:
@@ -235,46 +236,118 @@ async def wait_for_stale_agents_to_leave(
     return count
 
 
-class AgentRuntimeState:
+class ReplyOrchestrator:
     """
-    Prevent overlapping generate_reply() calls.
-    This is the main app-side mitigation for TTS stream races.
+    Production reply controller:
+    - single queue
+    - single worker
+    - reply cooldown
+    - one opening only
+    - graceful shutdown
     """
 
     def __init__(self) -> None:
+        self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=REPLY_QUEUE_MAXSIZE)
         self.reply_lock = asyncio.Lock()
-        self.opening_sent = False
+        self.worker_task: Optional[asyncio.Task] = None
         self.shutting_down = False
+        self.opening_sent = False
+        self.last_reply_time = 0.0
 
-    async def generate_reply_once(
-        self,
-        session: AgentSession,
-        instructions: str,
-        *,
-        timeout_s: float = 20.0,
-        tag: str = "reply",
-    ) -> bool:
+    async def start(self, session: AgentSession) -> None:
+        if self.worker_task and not self.worker_task.done():
+            return
+        self.worker_task = asyncio.create_task(self._worker(session), name="reply-worker")
+
+    async def stop(self) -> None:
+        self.shutting_down = True
+
+        # Wake the worker if it's waiting
+        with contextlib.suppress(asyncio.QueueFull):
+            self.queue.put_nowait(("__shutdown__", "__shutdown__"))
+
+        if self.worker_task:
+            self.worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.worker_task
+
+    async def enqueue(self, instructions: str, tag: str = "reply") -> bool:
         if self.shutting_down:
-            logger.info("skip generate_reply because runtime is shutting down tag=%s", tag)
+            logger.info("enqueue skipped because shutting down tag=%s", tag)
             return False
 
         text = clean_text(instructions)
         if not text:
-            logger.info("skip empty generate_reply tag=%s", tag)
+            logger.info("enqueue skipped empty text tag=%s", tag)
+            return False
+
+        try:
+            self.queue.put_nowait((text, tag))
+            logger.info("reply_enqueued tag=%s qsize=%s", tag, self.queue.qsize())
+            return True
+        except asyncio.QueueFull:
+            logger.warning("reply_queue_full dropping tag=%s", tag)
+            return False
+
+    async def send_opening(self, opening_line: str) -> bool:
+        if self.opening_sent:
+            logger.warning("opening called again; ignoring duplicate")
+            return False
+        self.opening_sent = True
+        return await self.enqueue(opening_line, tag="opening")
+
+    async def _worker(self, session: AgentSession) -> None:
+        logger.info("reply_worker_started")
+        try:
+            while not self.shutting_down:
+                instructions, tag = await self.queue.get()
+
+                if instructions == "__shutdown__":
+                    logger.info("reply_worker_received_shutdown")
+                    return
+
+                try:
+                    await self._generate_reply_once(session, instructions, tag=tag)
+                finally:
+                    self.queue.task_done()
+
+        except asyncio.CancelledError:
+            logger.info("reply_worker_cancelled")
+            raise
+        except Exception as e:
+            logger.exception("reply_worker_failed error=%s", e)
+            raise
+        finally:
+            logger.info("reply_worker_stopped")
+
+    async def _generate_reply_once(
+        self,
+        session: AgentSession,
+        instructions: str,
+        *,
+        tag: str,
+        timeout_s: float = REPLY_TIMEOUT_SECONDS,
+    ) -> bool:
+        if self.shutting_down:
+            logger.info("skip generate_reply because shutting down tag=%s", tag)
             return False
 
         async with self.reply_lock:
-            if self.shutting_down:
-                logger.info("skip locked generate_reply because runtime is shutting down tag=%s", tag)
-                return False
+            now = time.monotonic()
+            delta = now - self.last_reply_time
+            if delta < MIN_REPLY_GAP_SECONDS:
+                sleep_for = MIN_REPLY_GAP_SECONDS - delta
+                logger.info("reply_cooldown_wait tag=%s wait=%.2f", tag, sleep_for)
+                await asyncio.sleep(sleep_for)
 
-            logger.info("reply_start tag=%s text=%r", tag, text[:160])
+            logger.info("reply_start tag=%s text=%r", tag, instructions[:180])
 
             try:
                 await asyncio.wait_for(
-                    session.generate_reply(instructions=text),
+                    session.generate_reply(instructions=instructions),
                     timeout=timeout_s,
                 )
+                self.last_reply_time = time.monotonic()
                 logger.info("reply_done tag=%s", tag)
                 return True
             except asyncio.TimeoutError:
@@ -287,39 +360,21 @@ class AgentRuntimeState:
                 logger.exception("reply_failed tag=%s error=%s", tag, e)
                 return False
 
-    async def send_opening(
-        self,
-        session: AgentSession,
-        opening_line: str,
-    ) -> bool:
-        if self.opening_sent or self.shutting_down:
-            logger.info("opening skipped opening_sent=%s shutting_down=%s", self.opening_sent, self.shutting_down)
-            return False
-
-        self.opening_sent = True
-        return await self.generate_reply_once(
-            session,
-            opening_line,
-            timeout_s=20.0,
-            tag="opening",
-        )
-
-    async def shutdown(self) -> None:
-        self.shutting_down = True
-
 
 async def entrypoint(ctx: agents.JobContext):
     metadata: dict[str, Any] = {}
+    session: Optional[AgentSession] = None
+    runtime = ReplyOrchestrator()
 
     if hasattr(ctx.job, "metadata") and ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
         except Exception as e:
-            logger.exception("failed to parse job metadata: %s", e)
+            logger.exception("failed_to_parse_metadata error=%s", e)
             metadata = {}
 
-    if metadata and metadata.get("source") != "rockonlearn":
-        logger.info("ignoring non-rockonlearn job metadata=%s", metadata)
+    if metadata and metadata.get("source") != "zabano":
+        logger.info("ignoring_non_zabano_job metadata=%s", metadata)
         return
 
     agent_type = clean_text(metadata.get("agent_type"), DEFAULT_AGENT_TYPE)
@@ -331,26 +386,24 @@ async def entrypoint(ctx: agents.JobContext):
     opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
     voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
 
-    logger.info("agent_entry room=%s agent_type=%s voice=%s", getattr(ctx.room, "name", "unknown"), agent_type, voice)
-
-    await ctx.connect()
-
-    agent_count = await wait_for_stale_agents_to_leave(ctx.room)
-    if agent_count > 0:
-        logger.warning(
-            "room=%s still has %s active agent(s); skipping duplicate worker",
-            ctx.room.name,
-            agent_count,
-        )
-        ctx.shutdown("room_already_has_agent")
-        return
-
-    runtime = AgentRuntimeState()
+    room_name = getattr(ctx.room, "name", "unknown")
+    logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
 
     try:
+        await ctx.connect()
+
+        agent_count = await wait_for_stale_agents_to_leave(ctx.room)
+        if agent_count > 0:
+            logger.warning("room=%s still has %s active agent(s); skipping duplicate worker", ctx.room.name, agent_count)
+            ctx.shutdown("room_already_has_agent")
+            return
+
         session = AgentSession(
             stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
-            llm=openai.LLM(model=DEFAULT_LLM),
+            llm=openai.LLM(
+                model=DEFAULT_LLM,
+                max_retries=2,
+            ),
             tts=openai.TTS(voice=voice),
             vad=get_vad(),
         )
@@ -364,25 +417,34 @@ async def entrypoint(ctx: agents.JobContext):
 
         logger.info("agent_started room=%s", ctx.room.name)
 
-        # Important: only one short opening line.
-        # Do not pass serialized config, behavior JSON, or transcript here.
-        await runtime.send_opening(session, opening_line)
+        await runtime.start(session)
+        await runtime.send_opening(opening_line)
 
-        # Keep the worker alive while the room/session is active.
-        # Depending on your deployment, LiveKit may manage lifecycle already.
-        # This loop keeps the coroutine alive without generating extra speech.
-        while True:
-            await asyncio.sleep(2.0)
+        # Wait for the job lifecycle instead of keeping a manual infinite loop alive.
+        await ctx.wait_for_shutdown()
+
+        logger.info("ctx_shutdown_received room=%s", ctx.room.name)
 
     except asyncio.CancelledError:
-        logger.warning("agent_entry cancelled room=%s", getattr(ctx.room, "name", "unknown"))
+        logger.warning("agent_cancelled room=%s", room_name)
         raise
     except Exception as e:
-        logger.exception("agent error room=%s error=%s", getattr(ctx.room, "name", "unknown"), e)
+        logger.exception("agent_error room=%s error=%s", room_name, e)
         raise
     finally:
-        await runtime.shutdown()
-        logger.info("agent_cleanup room=%s", getattr(ctx.room, "name", "unknown"))
+        logger.info("agent_cleanup_start room=%s", room_name)
+
+        with contextlib.suppress(Exception):
+            await runtime.stop()
+
+        if session is not None:
+            # Best-effort close. Depending on SDK version, aclose may or may not exist.
+            close_method = getattr(session, "aclose", None)
+            if close_method is not None:
+                with contextlib.suppress(Exception):
+                    await close_method()
+
+        logger.info("agent_cleanup_done room=%s", room_name)
 
 
 if __name__ == "__main__":
