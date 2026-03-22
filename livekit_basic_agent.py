@@ -30,6 +30,9 @@ REPLY_TIMEOUT_SECONDS = float(os.getenv("REPLY_TIMEOUT_SECONDS", "25"))
 STALE_AGENT_WAIT_SECONDS = float(os.getenv("STALE_AGENT_WAIT_SECONDS", "3.5"))
 STALE_AGENT_POLL_SECONDS = float(os.getenv("STALE_AGENT_POLL_SECONDS", "0.35"))
 
+# Accept both names so future backend changes do not kill the job
+ALLOWED_SOURCES = {"zabano", "rockonlearn"}
+
 VOICE_MAP = {
     "tutor": ["nova", "coral"],
     "assessment": ["coral", "verse"],
@@ -217,10 +220,10 @@ def count_remote_agents(room: rtc.Room) -> int:
 
 
 async def wait_for_stale_agents_to_leave(
-    room: rtc.Room,
-    *,
-    max_wait_s: float = STALE_AGENT_WAIT_SECONDS,
-    poll_s: float = STALE_AGENT_POLL_SECONDS,
+        room: rtc.Room,
+        *,
+        max_wait_s: float = STALE_AGENT_WAIT_SECONDS,
+        poll_s: float = STALE_AGENT_POLL_SECONDS,
 ) -> int:
     count = count_remote_agents(room)
     if count == 0:
@@ -237,15 +240,6 @@ async def wait_for_stale_agents_to_leave(
 
 
 class ReplyOrchestrator:
-    """
-    Production reply controller:
-    - single queue
-    - single worker
-    - reply cooldown
-    - one opening only
-    - graceful shutdown
-    """
-
     def __init__(self) -> None:
         self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue(maxsize=REPLY_QUEUE_MAXSIZE)
         self.reply_lock = asyncio.Lock()
@@ -262,7 +256,6 @@ class ReplyOrchestrator:
     async def stop(self) -> None:
         self.shutting_down = True
 
-        # Wake the worker if it's waiting
         with contextlib.suppress(asyncio.QueueFull):
             self.queue.put_nowait(("__shutdown__", "__shutdown__"))
 
@@ -321,12 +314,12 @@ class ReplyOrchestrator:
             logger.info("reply_worker_stopped")
 
     async def _generate_reply_once(
-        self,
-        session: AgentSession,
-        instructions: str,
-        *,
-        tag: str,
-        timeout_s: float = REPLY_TIMEOUT_SECONDS,
+            self,
+            session: AgentSession,
+            instructions: str,
+            *,
+            tag: str,
+            timeout_s: float = REPLY_TIMEOUT_SECONDS,
     ) -> bool:
         if self.shutting_down:
             logger.info("skip generate_reply because shutting down tag=%s", tag)
@@ -365,6 +358,7 @@ async def entrypoint(ctx: agents.JobContext):
     metadata: dict[str, Any] = {}
     session: Optional[AgentSession] = None
     runtime = ReplyOrchestrator()
+    room_name = "unknown"
 
     if hasattr(ctx.job, "metadata") and ctx.job.metadata:
         try:
@@ -373,9 +367,13 @@ async def entrypoint(ctx: agents.JobContext):
             logger.exception("failed_to_parse_metadata error=%s", e)
             metadata = {}
 
-    if metadata and metadata.get("source") != "zabano":
-        logger.info("ignoring_non_zabano_job metadata=%s", metadata)
-        return
+    if metadata:
+        source = metadata.get("source")
+        if source not in ALLOWED_SOURCES:
+            logger.info("ignoring_non_allowed_source metadata=%s", metadata)
+            # Important: do a proper shutdown for unsupported jobs
+            ctx.shutdown("unsupported_source")
+            return
 
     agent_type = clean_text(metadata.get("agent_type"), DEFAULT_AGENT_TYPE)
     config = metadata.get("config") or {}
@@ -386,15 +384,23 @@ async def entrypoint(ctx: agents.JobContext):
     opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
     voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
 
-    room_name = getattr(ctx.room, "name", "unknown")
-    logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
-
     try:
         await ctx.connect()
+        room_name = getattr(ctx.room, "name", "unknown")
 
-        agent_count = await wait_for_stale_agents_to_leave(ctx.room)
-        if agent_count > 0:
-            logger.warning("room=%s still has %s active agent(s); skipping duplicate worker", ctx.room.name, agent_count)
+        logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
+
+        # Hard duplicate guard
+        existing_agents = count_remote_agents(ctx.room)
+        if existing_agents > 1:
+            logger.warning("room=%s already has %s agents after connect; shutting down duplicate", room_name,
+                           existing_agents)
+            ctx.shutdown("duplicate_agent_after_connect")
+            return
+
+        stale_count = await wait_for_stale_agents_to_leave(ctx.room)
+        if stale_count > 0:
+            logger.warning("room=%s still has %s active agent(s); skipping duplicate worker", room_name, stale_count)
             ctx.shutdown("room_already_has_agent")
             return
 
@@ -415,15 +421,28 @@ async def entrypoint(ctx: agents.JobContext):
             agent=assistant,
         )
 
-        logger.info("agent_started room=%s", ctx.room.name)
+        logger.info("agent_started room=%s", room_name)
 
         await runtime.start(session)
         await runtime.send_opening(opening_line)
 
-        # Wait for the job lifecycle instead of keeping a manual infinite loop alive.
-        await ctx.wait_for_shutdown()
+        # Compatible with your LiveKit version: use shutdown callback, not wait_for_shutdown()
+        shutdown_event = asyncio.Event()
 
-        logger.info("ctx_shutdown_received room=%s", ctx.room.name)
+        def _on_shutdown():
+            logger.info("ctx shutdown callback triggered room=%s", room_name)
+            shutdown_event.set()
+
+        # Your version may expose add_shutdown_callback
+        add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
+        if callable(add_shutdown_callback):
+            add_shutdown_callback(_on_shutdown)
+            await shutdown_event.wait()
+        else:
+            # Fallback: keep task alive and let cancellation/shutdown unwind it
+            logger.warning("ctx.add_shutdown_callback not available; using passive wait fallback")
+            while True:
+                await asyncio.sleep(2.0)
 
     except asyncio.CancelledError:
         logger.warning("agent_cancelled room=%s", room_name)
@@ -438,7 +457,6 @@ async def entrypoint(ctx: agents.JobContext):
             await runtime.stop()
 
         if session is not None:
-            # Best-effort close. Depending on SDK version, aclose may or may not exist.
             close_method = getattr(session, "aclose", None)
             if close_method is not None:
                 with contextlib.suppress(Exception):

@@ -25,10 +25,6 @@ DB_POOL_LOCK = asyncio.Lock()
 worker_server = None
 
 
-# ============================================================
-# Request models
-# ============================================================
-
 class JobConfig(BaseModel):
     native_language: str = Field(..., min_length=1)
     target_language: str = Field(..., min_length=1)
@@ -53,10 +49,6 @@ class JobRequest(BaseModel):
     transcript_room_name: str | None = None
     config: JobConfig
 
-
-# ============================================================
-# DB helpers
-# ============================================================
 
 async def init_db_pool():
     global DB_POOL
@@ -109,10 +101,6 @@ async def init_tables():
                            """)
 
 
-# ============================================================
-# Startup / shutdown
-# ============================================================
-
 @app.on_event("startup")
 async def startup_event():
     global worker_server
@@ -152,10 +140,6 @@ async def shutdown_event():
             print(f"⚠️ Error closing DB pool: {e}")
 
 
-# ============================================================
-# Metadata builder
-# ============================================================
-
 def build_dispatch_metadata(request: JobRequest) -> dict[str, Any]:
     transcript_room_name = (request.transcript_room_name or request.room_name).strip()
 
@@ -174,10 +158,6 @@ def create_livekit_api() -> api.LiveKitAPI:
         api_secret=os.getenv("LIVEKIT_API_SECRET"),
     )
 
-
-# ============================================================
-# Routes
-# ============================================================
 
 @app.post("/jobs")
 async def create_job(request: JobRequest):
