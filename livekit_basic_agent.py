@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import random
 from typing import Any
@@ -11,11 +12,17 @@ from livekit.plugins import openai, silero
 
 load_dotenv(".env")
 
+logger = logging.getLogger("rockonlearn.agent")
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
 
 # ============================================================
-# Static app policy
-# Everything here is product logic, not payload logic
+# Static application policy
 # ============================================================
+
+DEFAULT_AGENT_TYPE = "tutor"
+DEFAULT_LLM = os.getenv("LLM_CHOICE", "gpt-4o-mini")
+DEFAULT_STT_MODEL = "gpt-4o-mini-transcribe"
 
 VOICE_MAP = {
     "tutor": ["nova", "coral"],
@@ -23,9 +30,7 @@ VOICE_MAP = {
     "onboarding": ["nova"],
 }
 
-DEFAULT_AGENT_TYPE = "tutor"
-DEFAULT_LLM = os.getenv("LLM_CHOICE", "gpt-4o-mini")
-DEFAULT_STT_MODEL = "gpt-4o-mini-transcribe"
+_VAD_INSTANCE = None
 
 
 def clean_text(value: Any, default: str = "") -> str:
@@ -120,6 +125,7 @@ def static_safety_rules() -> str:
 - If the learner is confused, simplify.
 - If the learner makes several mistakes, correct only the most important one first.
 - Continue naturally from prior context if previous session information is provided.
+- Never output raw JSON or structured metadata as speech.
 """.strip()
 
 
@@ -128,14 +134,17 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
     target_language = clean_text(config.get("target_language"), "English")
     learner_level = normalize_level(clean_text(config.get("learner_level"), "A1"))
 
-    lesson_topic = clean_text(config.get("lesson_topic"))
-    lesson_goal = clean_text(config.get("lesson_goal"))
-    learner_interests_text = clean_text(config.get("learner_interests_text"))
-    learner_strengths_text = clean_text(config.get("learner_strengths_text"))
-    learner_weaknesses_text = clean_text(config.get("learner_weaknesses_text"))
-    progress_summary = clean_text(config.get("progress_summary"))
-    memory_summary = clean_text(config.get("memory_summary"))
-    resume_instruction = clean_text(config.get("resume_instruction"))
+    lesson_topic = clean_text(config.get("lesson_topic"), "General speaking practice")
+    lesson_goal = clean_text(config.get("lesson_goal"), "Help the learner practice effectively")
+    learner_interests_text = clean_text(config.get("learner_interests_text"), "Not provided")
+    learner_strengths_text = clean_text(config.get("learner_strengths_text"), "Not provided")
+    learner_weaknesses_text = clean_text(config.get("learner_weaknesses_text"), "Not provided")
+    progress_summary = clean_text(config.get("progress_summary"), "No prior progress summary provided.")
+    memory_summary = clean_text(config.get("memory_summary"), "No previous session summary provided.")
+    resume_instruction = clean_text(
+        config.get("resume_instruction"),
+        "If there was a previous session, continue naturally. Otherwise start simply.",
+    )
 
     role_text = static_agent_role(agent_type)
     teaching_policy_text = static_teaching_policy(agent_type)
@@ -151,13 +160,13 @@ Learner profile:
 - Native language: {native_language}
 - Target language: {target_language}
 - Level: {learner_level}
-- Interests: {learner_interests_text or "Not provided"}
-- Strengths: {learner_strengths_text or "Not provided"}
-- Weaknesses: {learner_weaknesses_text or "Not provided"}
+- Interests: {learner_interests_text}
+- Strengths: {learner_strengths_text}
+- Weaknesses: {learner_weaknesses_text}
 
 Lesson context:
-- Topic: {lesson_topic or "General language practice"}
-- Goal: {lesson_goal or "Help the learner practice effectively"}
+- Topic: {lesson_topic}
+- Goal: {lesson_goal}
 
 Language policy:
 {language_policy_text}
@@ -166,13 +175,13 @@ Teaching policy:
 {teaching_policy_text}
 
 Progress summary:
-{progress_summary or "No prior progress summary provided."}
+{progress_summary}
 
 Previous session summary:
-{memory_summary or "No previous session summary provided."}
+{memory_summary}
 
 Resume behavior:
-{resume_instruction or "If there was a previous session, continue naturally. Otherwise start simply."}
+{resume_instruction}
 
 Safety and operating rules:
 {safety_rules}
@@ -182,6 +191,20 @@ Safety and operating rules:
 class DynamicAssistant(Agent):
     def __init__(self, instructions: str):
         super().__init__(instructions=instructions)
+
+
+class CustomWhisperSTT(openai.STT):
+    async def transcribe(self, *args, **kwargs):
+        kwargs["task"] = "transcribe"
+        kwargs.pop("translate", None)
+        return await super().transcribe(*args, **kwargs)
+
+
+def get_vad():
+    global _VAD_INSTANCE
+    if _VAD_INSTANCE is None:
+        _VAD_INSTANCE = silero.VAD.load()
+    return _VAD_INSTANCE
 
 
 def count_remote_agents(room: rtc.Room) -> int:
@@ -212,21 +235,77 @@ async def wait_for_stale_agents_to_leave(
     return count
 
 
-class CustomWhisperSTT(openai.STT):
-    async def transcribe(self, *args, **kwargs):
-        kwargs["task"] = "transcribe"
-        kwargs.pop("translate", None)
-        return await super().transcribe(*args, **kwargs)
+class AgentRuntimeState:
+    """
+    Prevent overlapping generate_reply() calls.
+    This is the main app-side mitigation for TTS stream races.
+    """
 
+    def __init__(self) -> None:
+        self.reply_lock = asyncio.Lock()
+        self.opening_sent = False
+        self.shutting_down = False
 
-_VAD_INSTANCE = None
+    async def generate_reply_once(
+        self,
+        session: AgentSession,
+        instructions: str,
+        *,
+        timeout_s: float = 20.0,
+        tag: str = "reply",
+    ) -> bool:
+        if self.shutting_down:
+            logger.info("skip generate_reply because runtime is shutting down tag=%s", tag)
+            return False
 
+        text = clean_text(instructions)
+        if not text:
+            logger.info("skip empty generate_reply tag=%s", tag)
+            return False
 
-def get_vad():
-    global _VAD_INSTANCE
-    if _VAD_INSTANCE is None:
-        _VAD_INSTANCE = silero.VAD.load()
-    return _VAD_INSTANCE
+        async with self.reply_lock:
+            if self.shutting_down:
+                logger.info("skip locked generate_reply because runtime is shutting down tag=%s", tag)
+                return False
+
+            logger.info("reply_start tag=%s text=%r", tag, text[:160])
+
+            try:
+                await asyncio.wait_for(
+                    session.generate_reply(instructions=text),
+                    timeout=timeout_s,
+                )
+                logger.info("reply_done tag=%s", tag)
+                return True
+            except asyncio.TimeoutError:
+                logger.warning("reply_timeout tag=%s", tag)
+                return False
+            except asyncio.CancelledError:
+                logger.warning("reply_cancelled tag=%s", tag)
+                raise
+            except Exception as e:
+                logger.exception("reply_failed tag=%s error=%s", tag, e)
+                return False
+
+    async def send_opening(
+        self,
+        session: AgentSession,
+        opening_line: str,
+    ) -> bool:
+        if self.opening_sent or self.shutting_down:
+            logger.info("opening skipped opening_sent=%s shutting_down=%s", self.opening_sent, self.shutting_down)
+            return False
+
+        self.opening_sent = True
+        return await self.generate_reply_once(
+            session,
+            opening_line,
+            timeout_s=20.0,
+            tag="opening",
+        )
+
+    async def shutdown(self) -> None:
+        self.shutting_down = True
 
 
 async def entrypoint(ctx: agents.JobContext):
@@ -235,13 +314,12 @@ async def entrypoint(ctx: agents.JobContext):
     if hasattr(ctx.job, "metadata") and ctx.job.metadata:
         try:
             metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
-            print(f"📦 Metadata received for room={getattr(ctx.room, 'name', 'unknown')}: {metadata}")
         except Exception as e:
-            print(f"❌ Failed to parse job metadata: {e}")
+            logger.exception("failed to parse job metadata: %s", e)
             metadata = {}
 
-    if metadata and metadata.get("source") != "zabano":
-        print(f"⚠️ Ignoring non-zabano job: {metadata}")
+    if metadata and metadata.get("source") != "rockonlearn":
+        logger.info("ignoring non-rockonlearn job metadata=%s", metadata)
         return
 
     agent_type = clean_text(metadata.get("agent_type"), DEFAULT_AGENT_TYPE)
@@ -250,45 +328,61 @@ async def entrypoint(ctx: agents.JobContext):
         config = {}
 
     system_prompt = build_system_prompt(agent_type, config)
-    opening_line = clean_text(
-        config.get("opening_line"),
-        "Hello. Let's continue from where we left off."
-    )
+    opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
+    voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
+
+    logger.info("agent_entry room=%s agent_type=%s voice=%s", getattr(ctx.room, "name", "unknown"), agent_type, voice)
 
     await ctx.connect()
 
     agent_count = await wait_for_stale_agents_to_leave(ctx.room)
     if agent_count > 0:
-        print(
-            f"⚠️ Room {ctx.room.name} still has {agent_count} active agent(s). "
-            "Skipping duplicate worker."
+        logger.warning(
+            "room=%s still has %s active agent(s); skipping duplicate worker",
+            ctx.room.name,
+            agent_count,
         )
         ctx.shutdown("room_already_has_agent")
         return
 
-    voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
-    print(f"✅ Starting agent_type={agent_type} room={ctx.room.name} voice={voice}")
+    runtime = AgentRuntimeState()
 
-    session = AgentSession(
-        stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
-        llm=openai.LLM(model=DEFAULT_LLM),
-        tts=openai.TTS(voice=voice),
-        vad=get_vad(),
-    )
+    try:
+        session = AgentSession(
+            stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
+            llm=openai.LLM(model=DEFAULT_LLM),
+            tts=openai.TTS(voice=voice),
+            vad=get_vad(),
+        )
 
-    assistant = DynamicAssistant(instructions=system_prompt)
+        assistant = DynamicAssistant(instructions=system_prompt)
 
-    await session.start(
-        room=ctx.room,
-        agent=assistant,
-    )
+        await session.start(
+            room=ctx.room,
+            agent=assistant,
+        )
 
-    # Important:
-    # opening_line is a simple natural line only.
-    # Do NOT send serialized config or behavior JSON here.
-    await session.generate_reply(instructions=opening_line)
+        logger.info("agent_started room=%s", ctx.room.name)
 
-    print(f"✅ Agent started successfully in room={ctx.room.name}")
+        # Important: only one short opening line.
+        # Do not pass serialized config, behavior JSON, or transcript here.
+        await runtime.send_opening(session, opening_line)
+
+        # Keep the worker alive while the room/session is active.
+        # Depending on your deployment, LiveKit may manage lifecycle already.
+        # This loop keeps the coroutine alive without generating extra speech.
+        while True:
+            await asyncio.sleep(2.0)
+
+    except asyncio.CancelledError:
+        logger.warning("agent_entry cancelled room=%s", getattr(ctx.room, "name", "unknown"))
+        raise
+    except Exception as e:
+        logger.exception("agent error room=%s error=%s", getattr(ctx.room, "name", "unknown"), e)
+        raise
+    finally:
+        await runtime.shutdown()
+        logger.info("agent_cleanup room=%s", getattr(ctx.room, "name", "unknown"))
 
 
 if __name__ == "__main__":

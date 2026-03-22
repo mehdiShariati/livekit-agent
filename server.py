@@ -126,7 +126,7 @@ async def startup_event():
     worker_server = AgentServer()
     worker_server.rtc_session(
         entrypoint,
-        agent_name="zabano_agent",
+        agent_name="rockonlearn_agent",
     )
 
     asyncio.create_task(worker_server.run())
@@ -160,16 +160,12 @@ def build_dispatch_metadata(request: JobRequest) -> dict[str, Any]:
     transcript_room_name = (request.transcript_room_name or request.room_name).strip()
 
     return {
-        "source": "zabano",
+        "source": "rockonlearn",
         "agent_type": request.agent_type.strip() or "tutor",
         "transcript_room_name": transcript_room_name,
         "config": request.config.model_dump(),
     }
 
-
-# ============================================================
-# LiveKit API helper
-# ============================================================
 
 def create_livekit_api() -> api.LiveKitAPI:
     return api.LiveKitAPI(
@@ -230,7 +226,7 @@ async def create_job(request: JobRequest):
 
         dispatch = await lkapi.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
-                agent_name="zabano_agent",
+                agent_name="rockonlearn_agent",
                 room=request.room_name,
                 metadata=json.dumps(metadata_dict, ensure_ascii=False),
             )
@@ -243,7 +239,7 @@ async def create_job(request: JobRequest):
                                    status      = 'running',
                                    updated_at  = $3
                                WHERE room_name = $1
-                               """, request.room_name, dispatch.id, now)
+                               """, request.room_name, dispatch.id, datetime.now(timezone.utc))
 
         print(f"✅ Dispatch created successfully room={request.room_name}")
 
@@ -335,9 +331,6 @@ async def remove_job(room_name: str):
                            WHERE room_name = $1
                            """, room_name, datetime.now(timezone.utc))
 
-    # Note:
-    # This marks the job as closing in your DB.
-    # If you later add explicit LiveKit-side session termination, do it here too.
     return {
         "status": "closing",
         "room": room_name,
