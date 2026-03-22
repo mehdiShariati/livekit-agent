@@ -49,6 +49,8 @@ class JobRequest(BaseModel):
     room_name: str
     agent_type: str = "tutor"
     config: dict | None = None
+    # Same as room_name when resuming; explicit so workers/logs stay aligned with the Django room.
+    transcript_room_name: str | None = None
 
 
 @app.on_event("startup")
@@ -108,9 +110,14 @@ async def create_job(request: JobRequest):
                 api_secret=os.getenv("LIVEKIT_API_SECRET"),
             )
 
+            transcript_room = (request.transcript_room_name or request.room_name or "").strip()
+            if not transcript_room:
+                transcript_room = request.room_name
+
             metadata_dict = {
                 "agent_type": request.agent_type,
                 "source": "zabano",
+                "transcript_room_name": transcript_room,
             }
             if request.config:
                 metadata_dict["config"] = request.config

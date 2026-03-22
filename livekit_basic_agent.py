@@ -2,6 +2,7 @@ import json
 import random
 import os
 import asyncio
+from typing import Optional
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -49,9 +50,18 @@ AGENT_TYPES = {
 # 👩‍🏫 Dynamic Assistant class
 # ---------------------------------------------
 class DynamicAssistant(Agent):
-    def __init__(self, agent_type="tutor"):
+    def __init__(self, agent_type="tutor", transcript_context: Optional[str] = None):
         config = AGENT_TYPES.get(agent_type, AGENT_TYPES["tutor"])
-        super().__init__(instructions=config["instructions"])
+        instructions = config["instructions"]
+        extra = (transcript_context or "").strip()
+        if extra:
+            instructions = (
+                f"{instructions}\n\n"
+                "Prior conversation (same room / resumed session). Continue naturally; "
+                "do not restart the lesson from scratch unless the learner asks.\n"
+                f"{extra[-8000:]}"
+            )
+        super().__init__(instructions=instructions)
         self.agent_type = agent_type
 
 
@@ -114,6 +124,14 @@ async def entrypoint(ctx: agents.JobContext):
     if instruction:
         behavior = instruction.get('behavior')
 
+    transcript_context = ""
+    if isinstance(instruction, dict):
+        for key in ("chat_history", "conversation_history", "conversation_text"):
+            val = instruction.get(key)
+            if isinstance(val, str) and val.strip():
+                transcript_context = val.strip()
+                break
+
     # Connect to room
     await ctx.connect()
 
@@ -163,7 +181,10 @@ async def entrypoint(ctx: agents.JobContext):
         # await avatar.start(session, room=ctx.room)
 
         # Start the session
-        await session.start(room=ctx.room, agent=DynamicAssistant(agent_type))
+        await session.start(
+            room=ctx.room,
+            agent=DynamicAssistant(agent_type, transcript_context=transcript_context or None),
+        )
         greeting = config.get("greeting", "سلام! چطور می‌تونم کمکتون کنم؟")
 
         # Send greeting
