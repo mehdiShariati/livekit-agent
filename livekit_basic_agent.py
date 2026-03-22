@@ -7,6 +7,7 @@ import random
 import time
 from typing import Any, Optional
 
+import asyncpg
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession
@@ -40,6 +41,82 @@ VOICE_MAP = {
 }
 
 _VAD_INSTANCE = None
+_DB_POOL: Optional[asyncpg.Pool] = None
+_DB_POOL_LOCK = asyncio.Lock()
+
+
+async def get_db_pool() -> asyncpg.Pool:
+    global _DB_POOL
+    if _DB_POOL is None:
+        async with _DB_POOL_LOCK:
+            if _DB_POOL is None:
+                postgres_url = os.getenv("POSTGRES_URL")
+                if not postgres_url:
+                    raise RuntimeError("POSTGRES_URL is not set")
+                _DB_POOL = await asyncpg.create_pool(
+                    dsn=postgres_url,
+                    min_size=1,
+                    max_size=5,
+                )
+    return _DB_POOL
+
+
+async def ensure_agent_lock_table() -> None:
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_room_locks (
+                room_name TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+
+
+class PgRoomLock:
+    def __init__(self, room_name: str, owner_id: str):
+        self.room_name = room_name
+        self.owner_id = owner_id
+        self.acquired = False
+
+    async def acquire(self) -> bool:
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute("""
+                    INSERT INTO agent_room_locks (room_name, owner_id, created_at, updated_at)
+                    VALUES ($1, $2, NOW(), NOW())
+                    ON CONFLICT DO NOTHING
+                """, self.room_name, self.owner_id)
+
+                row = await conn.fetchrow("""
+                    SELECT owner_id
+                    FROM agent_room_locks
+                    WHERE room_name = $1
+                """, self.room_name)
+
+                if row and row["owner_id"] == self.owner_id:
+                    self.acquired = True
+                    return True
+                return False
+            except Exception:
+                logger.exception("pg_lock_acquire_failed room=%s owner=%s", self.room_name, self.owner_id)
+                return False
+
+    async def release(self) -> None:
+        if not self.acquired:
+            return
+
+        pool = await get_db_pool()
+        async with pool.acquire() as conn:
+            try:
+                await conn.execute("""
+                    DELETE FROM agent_room_locks
+                    WHERE room_name = $1 AND owner_id = $2
+                """, self.room_name, self.owner_id)
+            except Exception:
+                logger.exception("pg_lock_release_failed room=%s owner=%s", self.room_name, self.owner_id)
 
 
 def clean_text(value: Any, default: str = "") -> str:
@@ -256,7 +333,6 @@ class ReplyOrchestrator:
 
     async def stop(self) -> None:
         self.shutting_down = True
-
         with contextlib.suppress(asyncio.QueueFull):
             self.queue.put_nowait(("__shutdown__", "__shutdown__"))
 
@@ -267,12 +343,10 @@ class ReplyOrchestrator:
 
     async def enqueue(self, instructions: str, tag: str = "reply") -> bool:
         if self.shutting_down:
-            logger.info("enqueue skipped because shutting down tag=%s", tag)
             return False
 
         text = clean_text(instructions)
         if not text:
-            logger.info("enqueue skipped empty text tag=%s", tag)
             return False
 
         try:
@@ -308,9 +382,6 @@ class ReplyOrchestrator:
         except asyncio.CancelledError:
             logger.info("reply_worker_cancelled")
             raise
-        except Exception as e:
-            logger.exception("reply_worker_failed error=%s", e)
-            raise
         finally:
             logger.info("reply_worker_stopped")
 
@@ -323,16 +394,13 @@ class ReplyOrchestrator:
         timeout_s: float = REPLY_TIMEOUT_SECONDS,
     ) -> bool:
         if self.shutting_down:
-            logger.info("skip generate_reply because shutting down tag=%s", tag)
             return False
 
         async with self.reply_lock:
             now = time.monotonic()
             delta = now - self.last_reply_time
             if delta < MIN_REPLY_GAP_SECONDS:
-                sleep_for = MIN_REPLY_GAP_SECONDS - delta
-                logger.info("reply_cooldown_wait tag=%s wait=%.2f", tag, sleep_for)
-                await asyncio.sleep(sleep_for)
+                await asyncio.sleep(MIN_REPLY_GAP_SECONDS - delta)
 
             logger.info("reply_start tag=%s text=%r", tag, instructions[:180])
 
@@ -365,54 +433,51 @@ async def entrypoint(ctx: agents.JobContext):
     session: Optional[AgentSession] = None
     runtime = ReplyOrchestrator()
     room_name = "unknown"
-
-    if hasattr(ctx.job, "metadata") and ctx.job.metadata:
-        try:
-            metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
-        except Exception as e:
-            logger.exception("failed_to_parse_metadata error=%s", e)
-            metadata = {}
-
-    if metadata:
-        source = metadata.get("source")
-        if source not in ALLOWED_SOURCES:
-            logger.info("ignoring_non_allowed_source metadata=%s", metadata)
-            ctx.shutdown("unsupported_source")
-            return
-
-    agent_type = clean_text(metadata.get("agent_type"), DEFAULT_AGENT_TYPE)
-    config = metadata.get("config") or {}
-    if not isinstance(config, dict):
-        config = {}
-
-    system_prompt = build_system_prompt(agent_type, config)
-    opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
-    voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
+    room_lock: Optional[PgRoomLock] = None
+    owner_id = f"{os.getpid()}:{time.time_ns()}"
 
     try:
+        await ensure_agent_lock_table()
+
+        if hasattr(ctx.job, "metadata") and ctx.job.metadata:
+            try:
+                metadata = json.loads(ctx.job.metadata) if isinstance(ctx.job.metadata, str) else ctx.job.metadata
+            except Exception as e:
+                logger.exception("failed_to_parse_metadata error=%s", e)
+                metadata = {}
+
+        if metadata:
+            source = metadata.get("source")
+            if source not in ALLOWED_SOURCES:
+                logger.info("ignoring_non_allowed_source metadata=%s", metadata)
+                ctx.shutdown("unsupported_source")
+                return
+
+        agent_type = clean_text(metadata.get("agent_type"), DEFAULT_AGENT_TYPE)
+        config = metadata.get("config") or {}
+        if not isinstance(config, dict):
+            config = {}
+
+        system_prompt = build_system_prompt(agent_type, config)
+        opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
+        voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
+
         await ctx.connect()
         room_name = getattr(ctx.room, "name", "unknown")
-
         logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
 
-        # Duplicate guard
-        existing_agents = count_remote_agents(ctx.room)
-        if existing_agents > 1:
-            logger.warning(
-                "room=%s already has %s agents after connect; shutting down duplicate",
-                room_name,
-                existing_agents,
-            )
-            ctx.shutdown("duplicate_agent_after_connect")
+        # Strong cross-process lock
+        room_lock = PgRoomLock(room_name=room_name, owner_id=owner_id)
+        locked = await room_lock.acquire()
+        if not locked:
+            logger.warning("postgres_room_lock_denied room=%s owner=%s", room_name, owner_id)
+            ctx.shutdown("duplicate_agent_pg_lock")
             return
 
+        # Soft guards remain useful
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
         if stale_count > 0:
-            logger.warning(
-                "room=%s still has %s active agent(s); skipping duplicate worker",
-                room_name,
-                stale_count,
-            )
+            logger.warning("room=%s still has %s active agent(s); skipping duplicate worker", room_name, stale_count)
             ctx.shutdown("room_already_has_agent")
             return
 
@@ -453,7 +518,6 @@ async def entrypoint(ctx: agents.JobContext):
             add_shutdown_callback(_on_shutdown)
             await shutdown_event.wait()
         else:
-            logger.warning("ctx.add_shutdown_callback not available; using passive wait fallback")
             while True:
                 await asyncio.sleep(2.0)
 
@@ -474,6 +538,10 @@ async def entrypoint(ctx: agents.JobContext):
             if close_method is not None:
                 with contextlib.suppress(Exception):
                     await close_method()
+
+        if room_lock is not None:
+            with contextlib.suppress(Exception):
+                await room_lock.release()
 
         logger.info("agent_cleanup_done room=%s", room_name)
 

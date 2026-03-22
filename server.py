@@ -82,11 +82,8 @@ async def init_tables():
 async def startup_event():
     global worker_server
 
-    print("🚀 Starting application...")
-
     await init_db_pool()
     await init_tables()
-    print("✅ Database pool initialized and tables ensured")
 
     worker_server = AgentServer()
     worker_server.rtc_session(
@@ -95,7 +92,6 @@ async def startup_event():
     )
 
     asyncio.create_task(worker_server.run())
-    print("✅ LiveKit worker started")
 
 
 @app.on_event("shutdown")
@@ -103,18 +99,12 @@ async def shutdown_event():
     global DB_POOL, worker_server
 
     if worker_server is not None:
-        try:
+        with contextlib.suppress(Exception):
             await worker_server.aclose()
-            print("✅ LiveKit worker closed")
-        except Exception as e:
-            print(f"⚠️ Error closing LiveKit worker: {e}")
 
     if DB_POOL is not None:
-        try:
+        with contextlib.suppress(Exception):
             await DB_POOL.close()
-            print("✅ Database pool closed")
-        except Exception as e:
-            print(f"⚠️ Error closing DB pool: {e}")
 
 
 def build_dispatch_metadata(request: JobRequest) -> dict[str, Any]:
@@ -141,8 +131,6 @@ async def create_job(request: JobRequest):
     now = datetime.now(timezone.utc)
     transcript_room_name = (request.transcript_room_name or request.room_name).strip()
     metadata_dict = build_dispatch_metadata(request)
-
-    print(f"🔔 Received job request room={request.room_name} agent_type={request.agent_type}")
 
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow(
@@ -198,8 +186,6 @@ async def create_job(request: JobRequest):
                 WHERE room_name = $1
             """, request.room_name, dispatch.id, datetime.now(timezone.utc))
 
-        print(f"✅ Dispatch created successfully room={request.room_name}")
-
         return {
             "status": "started",
             "room": request.room_name,
@@ -215,7 +201,6 @@ async def create_job(request: JobRequest):
                 WHERE room_name = $1
             """, request.room_name, datetime.now(timezone.utc))
 
-        print(f"❌ Dispatch creation failed room={request.room_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
