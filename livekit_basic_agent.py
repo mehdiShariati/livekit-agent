@@ -429,17 +429,18 @@ async def entrypoint(ctx: agents.JobContext):
         # Compatible with your LiveKit version: use shutdown callback, not wait_for_shutdown()
         shutdown_event = asyncio.Event()
 
-        def _on_shutdown():
-            logger.info("ctx shutdown callback triggered room=%s", room_name)
-            shutdown_event.set()
+        async def _on_shutdown():
+            try:
+                logger.info("ctx shutdown callback triggered room=%s", room_name)
+                shutdown_event.set()
+            except Exception:
+                logger.exception("shutdown callback failed room=%s", room_name)
 
-        # Your version may expose add_shutdown_callback
         add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
         if callable(add_shutdown_callback):
             add_shutdown_callback(_on_shutdown)
             await shutdown_event.wait()
         else:
-            # Fallback: keep task alive and let cancellation/shutdown unwind it
             logger.warning("ctx.add_shutdown_callback not available; using passive wait fallback")
             while True:
                 await asyncio.sleep(2.0)
