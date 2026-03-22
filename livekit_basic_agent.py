@@ -29,13 +29,16 @@ async def init_db_pool():
 
 async def log_to_postgres(room_name: str, role: str, message: str):
     try:
+        if not message or not str(message).strip():
+            return
+
         await init_db_pool()
         query = """
             INSERT INTO chat_logs (room_name, role, message, created_at)
             VALUES ($1, $2, $3, NOW())
         """
         async with DB_POOL.acquire() as conn:
-            await conn.execute(query, room_name, role, message)
+            await conn.execute(query, room_name, role, str(message).strip())
     except Exception as e:
         print(f"DB log error: {e}")
 
@@ -44,8 +47,8 @@ def normalize_content(content) -> str:
     if content is None:
         return ""
     if isinstance(content, list):
-        return " ".join(str(item) for item in content)
-    return str(content)
+        return " ".join(str(item) for item in content).strip()
+    return str(content).strip()
 
 
 def build_instructions(agent_type: str, config_override: dict | None = None) -> str:
@@ -181,6 +184,20 @@ async def entrypoint(ctx: agents.JobContext):
             except Exception as e:
                 print(f"Error disconnecting room: {e}")
 
+        async def handle_transcript(transcript: str):
+            transcript = (transcript or "").strip()
+            print(f"🎙️ STT: {transcript}")
+            if transcript:
+                await log_to_postgres(ctx.room.name, "user", transcript)
+
+        async def handle_conversation_item(ev):
+            if getattr(ev.item, "role", "") != "assistant":
+                return
+
+            content = normalize_content(getattr(ev.item, "content", ""))
+            if content:
+                await log_to_postgres(ctx.room.name, "assistant", content)
+
         ctx.room.on(
             "participant_disconnected",
             lambda p: asyncio.create_task(handle_user_left(p)),
@@ -188,18 +205,12 @@ async def entrypoint(ctx: agents.JobContext):
 
         session.on(
             "user_input_transcribed",
-            lambda ev: print(f"🎙️ STT: {ev.transcript}"),
+            lambda ev: asyncio.create_task(handle_transcript(ev.transcript)),
         )
 
         session.on(
             "conversation_item_added",
-            lambda ev: asyncio.create_task(
-                log_to_postgres(
-                    ctx.room.name,
-                    "assistant" if getattr(ev.item, "role", "") == "assistant" else "user",
-                    normalize_content(getattr(ev.item, "content", "")),
-                )
-            ),
+            lambda ev: asyncio.create_task(handle_conversation_item(ev)),
         )
 
         print(f"🚀 Starting {agent_type} agent in room {ctx.room.name} with voice {voice}")
