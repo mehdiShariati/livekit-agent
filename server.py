@@ -1,14 +1,15 @@
-import json
-import os
 import asyncio
 import io
-import asyncpg
+import json
+import os
+from datetime import datetime, timezone
+from typing import Any
 
-from datetime import datetime
+import asyncpg
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel 
+from pydantic import BaseModel, Field
 
 from livekit import api
 from livekit.agents import AgentServer
@@ -21,11 +22,41 @@ app = FastAPI(title="LiveKit Agent Manager")
 
 DB_POOL = None
 DB_POOL_LOCK = asyncio.Lock()
-
-active_dispatches = {}
-dispatch_locks = {}
 worker_server = None
 
+
+# ============================================================
+# Request models
+# ============================================================
+
+class JobConfig(BaseModel):
+    native_language: str = Field(..., min_length=1)
+    target_language: str = Field(..., min_length=1)
+    learner_level: str = Field(..., min_length=1)
+
+    lesson_topic: str = Field(..., min_length=1)
+    lesson_goal: str = Field(..., min_length=1)
+
+    learner_interests_text: str = ""
+    learner_strengths_text: str = ""
+    learner_weaknesses_text: str = ""
+
+    progress_summary: str = ""
+    memory_summary: str = ""
+    resume_instruction: str = ""
+    opening_line: str = ""
+
+
+class JobRequest(BaseModel):
+    room_name: str = Field(..., min_length=1)
+    agent_type: str = Field(default="tutor", min_length=1)
+    transcript_room_name: str | None = None
+    config: JobConfig
+
+
+# ============================================================
+# DB helpers
+# ============================================================
 
 async def init_db_pool():
     global DB_POOL
@@ -35,23 +66,52 @@ async def init_db_pool():
                 DB_POOL = await asyncpg.create_pool(
                     dsn=os.getenv("POSTGRES_URL"),
                     min_size=1,
-                    max_size=5,
+                    max_size=10,
                 )
 
 
-async def get_room_lock(room_name: str):
-    if room_name not in dispatch_locks:
-        dispatch_locks[room_name] = asyncio.Lock()
-    return dispatch_locks[room_name]
+async def init_tables():
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("""
+                           CREATE TABLE IF NOT EXISTS agent_jobs
+                           (
+                               room_name
+                               TEXT
+                               PRIMARY
+                               KEY,
+                               agent_type
+                               TEXT
+                               NOT
+                               NULL,
+                               transcript_room_name
+                               TEXT
+                               NOT
+                               NULL,
+                               dispatch_id
+                               TEXT,
+                               status
+                               TEXT
+                               NOT
+                               NULL,
+                               metadata_json
+                               JSONB
+                               NOT
+                               NULL,
+                               created_at
+                               TIMESTAMPTZ
+                               NOT
+                               NULL,
+                               updated_at
+                               TIMESTAMPTZ
+                               NOT
+                               NULL
+                           )
+                           """)
 
 
-class JobRequest(BaseModel):
-    room_name: str
-    agent_type: str = "tutor"
-    config: dict | None = None
-    # Same as room_name when resuming; explicit so workers/logs stay aligned with the Django room.
-    transcript_room_name: str | None = None
-
+# ============================================================
+# Startup / shutdown
+# ============================================================
 
 @app.on_event("startup")
 async def startup_event():
@@ -60,7 +120,8 @@ async def startup_event():
     print("🚀 Starting application...")
 
     await init_db_pool()
-    print("✅ Database pool initialized")
+    await init_tables()
+    print("✅ Database pool initialized and tables ensured")
 
     worker_server = AgentServer()
     worker_server.rtc_session(
@@ -91,121 +152,212 @@ async def shutdown_event():
             print(f"⚠️ Error closing DB pool: {e}")
 
 
+# ============================================================
+# Metadata builder
+# ============================================================
+
+def build_dispatch_metadata(request: JobRequest) -> dict[str, Any]:
+    transcript_room_name = (request.transcript_room_name or request.room_name).strip()
+
+    return {
+        "source": "zabano",
+        "agent_type": request.agent_type.strip() or "tutor",
+        "transcript_room_name": transcript_room_name,
+        "config": request.config.model_dump(),
+    }
+
+
+# ============================================================
+# LiveKit API helper
+# ============================================================
+
+def create_livekit_api() -> api.LiveKitAPI:
+    return api.LiveKitAPI(
+        url=os.getenv("LIVEKIT_URL"),
+        api_key=os.getenv("LIVEKIT_API_KEY"),
+        api_secret=os.getenv("LIVEKIT_API_SECRET"),
+    )
+
+
+# ============================================================
+# Routes
+# ============================================================
+
 @app.post("/jobs")
 async def create_job(request: JobRequest):
-    timestamp = datetime.now().isoformat()
-    print(f"🔔 [{timestamp}] Received job request:")
-    print(f"   Room: {request.room_name}")
-    print(f"   Agent Type: {request.agent_type}")
-    print(f"   Config: {request.config}")
+    now = datetime.now(timezone.utc)
+    transcript_room_name = (request.transcript_room_name or request.room_name).strip()
+    metadata_dict = build_dispatch_metadata(request)
 
-    lock = await get_room_lock(request.room_name)
+    print(f"🔔 Received job request room={request.room_name} agent_type={request.agent_type}")
 
-    async with lock:
-        lkapi = None
-        try:
-            lkapi = api.LiveKitAPI(
-                url=os.getenv("LIVEKIT_URL"),
-                api_key=os.getenv("LIVEKIT_API_KEY"),
-                api_secret=os.getenv("LIVEKIT_API_SECRET"),
-            )
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT room_name, status, dispatch_id FROM agent_jobs WHERE room_name = $1",
+            request.room_name,
+        )
 
-            transcript_room = (request.transcript_room_name or request.room_name or "").strip()
-            if not transcript_room:
-                transcript_room = request.room_name
-
-            metadata_dict = {
-                "agent_type": request.agent_type,
-                "source": "zabano",
-                "transcript_room_name": transcript_room,
-            }
-            if request.config:
-                metadata_dict["config"] = request.config
-
-            dispatch = await lkapi.agent_dispatch.create_dispatch(
-                api.CreateAgentDispatchRequest(
-                    agent_name="zabano_agent",
-                    room=request.room_name,
-                    metadata=json.dumps(metadata_dict),
-                )
-            )
-
-            active_dispatches[request.room_name] = {
-                "agent_type": request.agent_type,
-                "dispatch_id": dispatch.id,
-                "timestamp": timestamp,
-                "config": request.config,
-            }
-
-            print(f"✅ [{timestamp}] Dispatch created successfully for room {request.room_name}")
+        if row and row["status"] in ("pending", "running"):
             return {
-                "status": "started",
-                "agent_type": request.agent_type,
+                "status": "already_active",
                 "room": request.room_name,
-                "dispatch_id": dispatch.id,
-                "message": f"Agent {request.agent_type} started in room {request.room_name}",
+                "agent_type": request.agent_type,
+                "message": "An active agent job already exists for this room.",
             }
 
-        except Exception as e:
-            print(f"❌ [{timestamp}] Dispatch error: {e}")
-            import traceback
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+        await conn.execute("""
+                           INSERT INTO agent_jobs (room_name, agent_type, transcript_room_name, dispatch_id,
+                                                   status, metadata_json, created_at, updated_at)
+                           VALUES ($1, $2, $3, NULL, 'pending', $4::jsonb, $5, $5) ON CONFLICT (room_name)
+            DO
+                           UPDATE SET
+                               agent_type = EXCLUDED.agent_type,
+                               transcript_room_name = EXCLUDED.transcript_room_name,
+                               dispatch_id = NULL,
+                               status = 'pending',
+                               metadata_json = EXCLUDED.metadata_json,
+                               updated_at = EXCLUDED.updated_at
+                           """,
+                           request.room_name,
+                           request.agent_type,
+                           transcript_room_name,
+                           json.dumps(metadata_dict, ensure_ascii=False),
+                           now)
 
-        finally:
-            if lkapi is not None:
-                await lkapi.aclose()
+    lkapi = None
+    try:
+        lkapi = create_livekit_api()
 
+        dispatch = await lkapi.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name="zabano_agent",
+                room=request.room_name,
+                metadata=json.dumps(metadata_dict, ensure_ascii=False),
+            )
+        )
 
-@app.delete("/jobs/{room_name}")
-async def remove_job(room_name: str):
-    timestamp = datetime.now().isoformat()
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("""
+                               UPDATE agent_jobs
+                               SET dispatch_id = $2,
+                                   status      = 'running',
+                                   updated_at  = $3
+                               WHERE room_name = $1
+                               """, request.room_name, dispatch.id, now)
 
-    if room_name in active_dispatches:
-        dispatch_info = active_dispatches.pop(room_name)
+        print(f"✅ Dispatch created successfully room={request.room_name}")
 
-        print(f"🗑️ [{timestamp}] Removed dispatch tracking for room: {room_name}")
         return {
-            "status": "removed",
-            "room": room_name,
-            "dispatch_info": dispatch_info,
+            "status": "started",
+            "room": request.room_name,
+            "agent_type": request.agent_type,
+            "message": "Agent dispatch created successfully.",
         }
 
-    print(f"⚠️ [{timestamp}] No dispatch found for room: {room_name}")
-    return {
-        "status": "not_found",
-        "room": room_name,
-        "message": f"No active dispatch found for room {room_name}",
-    }
+    except Exception as e:
+        async with DB_POOL.acquire() as conn:
+            await conn.execute("""
+                               UPDATE agent_jobs
+                               SET status     = 'failed',
+                                   updated_at = $2
+                               WHERE room_name = $1
+                               """, request.room_name, datetime.now(timezone.utc))
+
+        print(f"❌ Dispatch creation failed room={request.room_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        if lkapi is not None:
+            await lkapi.aclose()
 
 
 @app.get("/jobs")
 async def list_jobs():
+    async with DB_POOL.acquire() as conn:
+        rows = await conn.fetch("""
+                                SELECT room_name,
+                                       agent_type,
+                                       transcript_room_name,
+                                       dispatch_id,
+                                       status,
+                                       created_at,
+                                       updated_at
+                                FROM agent_jobs
+                                ORDER BY updated_at DESC
+                                """)
+
     return {
-        "active_dispatches": active_dispatches,
-        "count": len(active_dispatches),
-        "rooms": list(active_dispatches.keys()),
+        "count": len(rows),
+        "jobs": [dict(row) for row in rows],
     }
 
 
 @app.get("/jobs/{room_name}")
 async def get_job(room_name: str):
-    if room_name in active_dispatches:
-        return {
-            "status": "active",
-            "room": room_name,
-            "dispatch": active_dispatches[room_name],
-        }
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow("""
+                                  SELECT room_name,
+                                         agent_type,
+                                         transcript_room_name,
+                                         dispatch_id,
+                                         status,
+                                         created_at,
+                                         updated_at
+                                  FROM agent_jobs
+                                  WHERE room_name = $1
+                                  """, room_name)
 
-    raise HTTPException(status_code=404, detail=f"No active dispatch found for room {room_name}")
+    if not row:
+        raise HTTPException(status_code=404, detail="No job found for this room.")
+
+    return dict(row)
+
+
+@app.delete("/jobs/{room_name}")
+async def remove_job(room_name: str):
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT room_name, status, dispatch_id FROM agent_jobs WHERE room_name = $1",
+            room_name,
+        )
+
+        if not row:
+            return {
+                "status": "not_found",
+                "room": room_name,
+                "message": "No job found.",
+            }
+
+        await conn.execute("""
+                           UPDATE agent_jobs
+                           SET status     = 'closing',
+                               updated_at = $2
+                           WHERE room_name = $1
+                           """, room_name, datetime.now(timezone.utc))
+
+    # Note:
+    # This marks the job as closing in your DB.
+    # If you later add explicit LiveKit-side session termination, do it here too.
+    return {
+        "status": "closing",
+        "room": room_name,
+        "message": "Job marked as closing.",
+    }
 
 
 @app.get("/health")
 async def health_check():
+    async with DB_POOL.acquire() as conn:
+        active_count = await conn.fetchval("""
+                                           SELECT COUNT(*)
+                                           FROM agent_jobs
+                                           WHERE status IN ('pending', 'running')
+                                           """)
+
     return {
         "status": "healthy",
-        "active_dispatches": len(active_dispatches),
-        "timestamp": datetime.now().isoformat(),
+        "active_jobs": active_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -217,11 +369,11 @@ async def get_chat_log(room_name: str):
         raise HTTPException(status_code=500, detail="Database pool is not initialized")
 
     query = """
-        SELECT role, message, created_at
-        FROM chat_logs
-        WHERE room_name = $1
-        ORDER BY created_at ASC
-    """
+            SELECT role, message, created_at
+            FROM chat_logs
+            WHERE room_name = $1
+            ORDER BY created_at ASC \
+            """
 
     async with DB_POOL.acquire() as conn:
         records = await conn.fetch(query, room_name)
