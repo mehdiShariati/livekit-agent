@@ -65,40 +65,17 @@ async def init_db_pool():
 async def init_tables():
     async with DB_POOL.acquire() as conn:
         await conn.execute("""
-                           CREATE TABLE IF NOT EXISTS agent_jobs
-                           (
-                               room_name
-                               TEXT
-                               PRIMARY
-                               KEY,
-                               agent_type
-                               TEXT
-                               NOT
-                               NULL,
-                               transcript_room_name
-                               TEXT
-                               NOT
-                               NULL,
-                               dispatch_id
-                               TEXT,
-                               status
-                               TEXT
-                               NOT
-                               NULL,
-                               metadata_json
-                               JSONB
-                               NOT
-                               NULL,
-                               created_at
-                               TIMESTAMPTZ
-                               NOT
-                               NULL,
-                               updated_at
-                               TIMESTAMPTZ
-                               NOT
-                               NULL
-                           )
-                           """)
+            CREATE TABLE IF NOT EXISTS agent_jobs (
+                room_name TEXT PRIMARY KEY,
+                agent_type TEXT NOT NULL,
+                transcript_room_name TEXT NOT NULL,
+                dispatch_id TEXT,
+                status TEXT NOT NULL,
+                metadata_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+        """)
 
 
 @app.on_event("startup")
@@ -182,23 +159,25 @@ async def create_job(request: JobRequest):
             }
 
         await conn.execute("""
-                           INSERT INTO agent_jobs (room_name, agent_type, transcript_room_name, dispatch_id,
-                                                   status, metadata_json, created_at, updated_at)
-                           VALUES ($1, $2, $3, NULL, 'pending', $4::jsonb, $5, $5) ON CONFLICT (room_name)
-            DO
-                           UPDATE SET
-                               agent_type = EXCLUDED.agent_type,
-                               transcript_room_name = EXCLUDED.transcript_room_name,
-                               dispatch_id = NULL,
-                               status = 'pending',
-                               metadata_json = EXCLUDED.metadata_json,
-                               updated_at = EXCLUDED.updated_at
-                           """,
-                           request.room_name,
-                           request.agent_type,
-                           transcript_room_name,
-                           json.dumps(metadata_dict, ensure_ascii=False),
-                           now)
+            INSERT INTO agent_jobs (
+                room_name, agent_type, transcript_room_name, dispatch_id,
+                status, metadata_json, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, NULL, 'pending', $4::jsonb, $5, $5)
+            ON CONFLICT (room_name)
+            DO UPDATE SET
+                agent_type = EXCLUDED.agent_type,
+                transcript_room_name = EXCLUDED.transcript_room_name,
+                dispatch_id = NULL,
+                status = 'pending',
+                metadata_json = EXCLUDED.metadata_json,
+                updated_at = EXCLUDED.updated_at
+        """,
+        request.room_name,
+        request.agent_type,
+        transcript_room_name,
+        json.dumps(metadata_dict, ensure_ascii=False),
+        now)
 
     lkapi = None
     try:
@@ -214,12 +193,10 @@ async def create_job(request: JobRequest):
 
         async with DB_POOL.acquire() as conn:
             await conn.execute("""
-                               UPDATE agent_jobs
-                               SET dispatch_id = $2,
-                                   status      = 'running',
-                                   updated_at  = $3
-                               WHERE room_name = $1
-                               """, request.room_name, dispatch.id, datetime.now(timezone.utc))
+                UPDATE agent_jobs
+                SET dispatch_id = $2, status = 'running', updated_at = $3
+                WHERE room_name = $1
+            """, request.room_name, dispatch.id, datetime.now(timezone.utc))
 
         print(f"✅ Dispatch created successfully room={request.room_name}")
 
@@ -233,11 +210,10 @@ async def create_job(request: JobRequest):
     except Exception as e:
         async with DB_POOL.acquire() as conn:
             await conn.execute("""
-                               UPDATE agent_jobs
-                               SET status     = 'failed',
-                                   updated_at = $2
-                               WHERE room_name = $1
-                               """, request.room_name, datetime.now(timezone.utc))
+                UPDATE agent_jobs
+                SET status = 'failed', updated_at = $2
+                WHERE room_name = $1
+            """, request.room_name, datetime.now(timezone.utc))
 
         print(f"❌ Dispatch creation failed room={request.room_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -251,16 +227,10 @@ async def create_job(request: JobRequest):
 async def list_jobs():
     async with DB_POOL.acquire() as conn:
         rows = await conn.fetch("""
-                                SELECT room_name,
-                                       agent_type,
-                                       transcript_room_name,
-                                       dispatch_id,
-                                       status,
-                                       created_at,
-                                       updated_at
-                                FROM agent_jobs
-                                ORDER BY updated_at DESC
-                                """)
+            SELECT room_name, agent_type, transcript_room_name, dispatch_id, status, created_at, updated_at
+            FROM agent_jobs
+            ORDER BY updated_at DESC
+        """)
 
     return {
         "count": len(rows),
@@ -272,16 +242,10 @@ async def list_jobs():
 async def get_job(room_name: str):
     async with DB_POOL.acquire() as conn:
         row = await conn.fetchrow("""
-                                  SELECT room_name,
-                                         agent_type,
-                                         transcript_room_name,
-                                         dispatch_id,
-                                         status,
-                                         created_at,
-                                         updated_at
-                                  FROM agent_jobs
-                                  WHERE room_name = $1
-                                  """, room_name)
+            SELECT room_name, agent_type, transcript_room_name, dispatch_id, status, created_at, updated_at
+            FROM agent_jobs
+            WHERE room_name = $1
+        """, room_name)
 
     if not row:
         raise HTTPException(status_code=404, detail="No job found for this room.")
@@ -305,11 +269,10 @@ async def remove_job(room_name: str):
             }
 
         await conn.execute("""
-                           UPDATE agent_jobs
-                           SET status     = 'closing',
-                               updated_at = $2
-                           WHERE room_name = $1
-                           """, room_name, datetime.now(timezone.utc))
+            UPDATE agent_jobs
+            SET status = 'closing', updated_at = $2
+            WHERE room_name = $1
+        """, room_name, datetime.now(timezone.utc))
 
     return {
         "status": "closing",
@@ -322,10 +285,10 @@ async def remove_job(room_name: str):
 async def health_check():
     async with DB_POOL.acquire() as conn:
         active_count = await conn.fetchval("""
-                                           SELECT COUNT(*)
-                                           FROM agent_jobs
-                                           WHERE status IN ('pending', 'running')
-                                           """)
+            SELECT COUNT(*)
+            FROM agent_jobs
+            WHERE status IN ('pending', 'running')
+        """)
 
     return {
         "status": "healthy",
@@ -342,11 +305,11 @@ async def get_chat_log(room_name: str):
         raise HTTPException(status_code=500, detail="Database pool is not initialized")
 
     query = """
-            SELECT role, message, created_at
-            FROM chat_logs
-            WHERE room_name = $1
-            ORDER BY created_at ASC \
-            """
+        SELECT role, message, created_at
+        FROM chat_logs
+        WHERE room_name = $1
+        ORDER BY created_at ASC
+    """
 
     async with DB_POOL.acquire() as conn:
         records = await conn.fetch(query, room_name)

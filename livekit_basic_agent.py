@@ -26,11 +26,11 @@ DEFAULT_STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
 
 REPLY_QUEUE_MAXSIZE = int(os.getenv("REPLY_QUEUE_MAXSIZE", "8"))
 MIN_REPLY_GAP_SECONDS = float(os.getenv("MIN_REPLY_GAP_SECONDS", "1.25"))
-REPLY_TIMEOUT_SECONDS = float(os.getenv("REPLY_TIMEOUT_SECONDS", "25"))
+REPLY_TIMEOUT_SECONDS = float(os.getenv("REPLY_TIMEOUT_SECONDS", "20"))
 STALE_AGENT_WAIT_SECONDS = float(os.getenv("STALE_AGENT_WAIT_SECONDS", "3.5"))
 STALE_AGENT_POLL_SECONDS = float(os.getenv("STALE_AGENT_POLL_SECONDS", "0.35"))
+MAX_CONCURRENT_LLM_CALLS = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "1"))
 
-# Accept both names so future backend changes do not kill the job
 ALLOWED_SOURCES = {"zabano", "rockonlearn"}
 
 VOICE_MAP = {
@@ -220,10 +220,10 @@ def count_remote_agents(room: rtc.Room) -> int:
 
 
 async def wait_for_stale_agents_to_leave(
-        room: rtc.Room,
-        *,
-        max_wait_s: float = STALE_AGENT_WAIT_SECONDS,
-        poll_s: float = STALE_AGENT_POLL_SECONDS,
+    room: rtc.Room,
+    *,
+    max_wait_s: float = STALE_AGENT_WAIT_SECONDS,
+    poll_s: float = STALE_AGENT_POLL_SECONDS,
 ) -> int:
     count = count_remote_agents(room)
     if count == 0:
@@ -247,6 +247,7 @@ class ReplyOrchestrator:
         self.shutting_down = False
         self.opening_sent = False
         self.last_reply_time = 0.0
+        self.concurrent_llm_calls = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 
     async def start(self, session: AgentSession) -> None:
         if self.worker_task and not self.worker_task.done():
@@ -314,12 +315,12 @@ class ReplyOrchestrator:
             logger.info("reply_worker_stopped")
 
     async def _generate_reply_once(
-            self,
-            session: AgentSession,
-            instructions: str,
-            *,
-            tag: str,
-            timeout_s: float = REPLY_TIMEOUT_SECONDS,
+        self,
+        session: AgentSession,
+        instructions: str,
+        *,
+        tag: str,
+        timeout_s: float = REPLY_TIMEOUT_SECONDS,
     ) -> bool:
         if self.shutting_down:
             logger.info("skip generate_reply because shutting down tag=%s", tag)
@@ -336,10 +337,11 @@ class ReplyOrchestrator:
             logger.info("reply_start tag=%s text=%r", tag, instructions[:180])
 
             try:
-                await asyncio.wait_for(
-                    session.generate_reply(instructions=instructions),
-                    timeout=timeout_s,
-                )
+                async with self.concurrent_llm_calls:
+                    await asyncio.wait_for(
+                        session.generate_reply(instructions=instructions),
+                        timeout=timeout_s,
+                    )
                 self.last_reply_time = time.monotonic()
                 logger.info("reply_done tag=%s", tag)
                 return True
@@ -350,6 +352,10 @@ class ReplyOrchestrator:
                 logger.warning("reply_cancelled tag=%s", tag)
                 raise
             except Exception as e:
+                msg = str(e)
+                if "Too many open files" in msg or "Errno 24" in msg:
+                    logger.error("fd_exhaustion_detected tag=%s error=%s", tag, e)
+                    return False
                 logger.exception("reply_failed tag=%s error=%s", tag, e)
                 return False
 
@@ -371,7 +377,6 @@ async def entrypoint(ctx: agents.JobContext):
         source = metadata.get("source")
         if source not in ALLOWED_SOURCES:
             logger.info("ignoring_non_allowed_source metadata=%s", metadata)
-            # Important: do a proper shutdown for unsupported jobs
             ctx.shutdown("unsupported_source")
             return
 
@@ -390,17 +395,24 @@ async def entrypoint(ctx: agents.JobContext):
 
         logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
 
-        # Hard duplicate guard
+        # Duplicate guard
         existing_agents = count_remote_agents(ctx.room)
         if existing_agents > 1:
-            logger.warning("room=%s already has %s agents after connect; shutting down duplicate", room_name,
-                           existing_agents)
+            logger.warning(
+                "room=%s already has %s agents after connect; shutting down duplicate",
+                room_name,
+                existing_agents,
+            )
             ctx.shutdown("duplicate_agent_after_connect")
             return
 
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
         if stale_count > 0:
-            logger.warning("room=%s still has %s active agent(s); skipping duplicate worker", room_name, stale_count)
+            logger.warning(
+                "room=%s still has %s active agent(s); skipping duplicate worker",
+                room_name,
+                stale_count,
+            )
             ctx.shutdown("room_already_has_agent")
             return
 
@@ -408,7 +420,8 @@ async def entrypoint(ctx: agents.JobContext):
             stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
             llm=openai.LLM(
                 model=DEFAULT_LLM,
-                max_retries=2,
+                max_retries=1,
+                timeout=15,
             ),
             tts=openai.TTS(voice=voice),
             vad=get_vad(),
@@ -426,7 +439,6 @@ async def entrypoint(ctx: agents.JobContext):
         await runtime.start(session)
         await runtime.send_opening(opening_line)
 
-        # Compatible with your LiveKit version: use shutdown callback, not wait_for_shutdown()
         shutdown_event = asyncio.Event()
 
         async def _on_shutdown():
