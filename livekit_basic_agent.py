@@ -143,6 +143,8 @@ def static_safety_rules() -> str:
 def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
     native_language = clean_text(config.get("native_language"), "English")
     target_language = clean_text(config.get("target_language"), "English")
+    speaking_language = clean_text(config.get("speaking_language"), target_language or "English")
+    assessment_type = clean_text(config.get("assessment_type"), "")
     learner_level = normalize_level(clean_text(config.get("learner_level"), "A1"))
 
     lesson_topic = clean_text(config.get("lesson_topic"), "General speaking practice")
@@ -165,7 +167,9 @@ Teach naturally in real-time spoken conversation.
 Learner profile:
 - Native language: {native_language}
 - Target language: {target_language}
+- Speaking language in this session: {speaking_language}
 - Level: {learner_level}
+- Assessment type: {assessment_type or "none"}
 - Interests: {learner_interests_text}
 - Strengths: {learner_strengths_text}
 - Weaknesses: {learner_weaknesses_text}

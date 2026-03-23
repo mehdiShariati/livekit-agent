@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -26,9 +27,16 @@ DB_POOL_LOCK = asyncio.Lock()
 worker_server = None
 
 
+def stable_lock_key(room_name: str) -> int:
+    digest = hashlib.sha256(room_name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) % (2**63 - 1)
+
+
 class JobConfig(BaseModel):
     native_language: str = Field(..., min_length=1)
     target_language: str = Field(..., min_length=1)
+    speaking_language: str = ""
+    assessment_type: str = ""
     learner_level: str = Field(..., min_length=1)
 
     lesson_topic: str = Field(..., min_length=1)
@@ -132,41 +140,55 @@ async def create_job(request: JobRequest):
     now = datetime.now(timezone.utc)
     transcript_room_name = (request.transcript_room_name or request.room_name).strip()
     metadata_dict = build_dispatch_metadata(request)
+    lock_key = stable_lock_key(request.room_name)
 
     async with DB_POOL.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT room_name, status, dispatch_id FROM agent_jobs WHERE room_name = $1",
-            request.room_name,
-        )
-
-        if row and row["status"] in ("pending", "running"):
-            return {
-                "status": "already_active",
-                "room": request.room_name,
-                "agent_type": request.agent_type,
-                "message": "An active agent job already exists for this room.",
-            }
-
-        await conn.execute("""
-            INSERT INTO agent_jobs (
-                room_name, agent_type, transcript_room_name, dispatch_id,
-                status, metadata_json, created_at, updated_at
+        async with conn.transaction():
+            lock_acquired = await conn.fetchval(
+                "SELECT pg_try_advisory_xact_lock($1::bigint)",
+                lock_key,
             )
-            VALUES ($1, $2, $3, NULL, 'pending', $4::jsonb, $5, $5)
-            ON CONFLICT (room_name)
-            DO UPDATE SET
-                agent_type = EXCLUDED.agent_type,
-                transcript_room_name = EXCLUDED.transcript_room_name,
-                dispatch_id = NULL,
-                status = 'pending',
-                metadata_json = EXCLUDED.metadata_json,
-                updated_at = EXCLUDED.updated_at
-        """,
-        request.room_name,
-        request.agent_type,
-        transcript_room_name,
-        json.dumps(metadata_dict, ensure_ascii=False),
-        now)
+            if not lock_acquired:
+                return {
+                    "status": "already_active",
+                    "room": request.room_name,
+                    "agent_type": request.agent_type,
+                    "message": "A job creation is already in progress for this room.",
+                }
+
+            row = await conn.fetchrow(
+                "SELECT room_name, status, dispatch_id FROM agent_jobs WHERE room_name = $1",
+                request.room_name,
+            )
+
+            if row and row["status"] in ("dispatching", "pending", "running"):
+                return {
+                    "status": "already_active",
+                    "room": request.room_name,
+                    "agent_type": request.agent_type,
+                    "message": "An active agent job already exists for this room.",
+                }
+
+            await conn.execute("""
+                INSERT INTO agent_jobs (
+                    room_name, agent_type, transcript_room_name, dispatch_id,
+                    status, metadata_json, created_at, updated_at
+                )
+                VALUES ($1, $2, $3, NULL, 'dispatching', $4::jsonb, $5, $5)
+                ON CONFLICT (room_name)
+                DO UPDATE SET
+                    agent_type = EXCLUDED.agent_type,
+                    transcript_room_name = EXCLUDED.transcript_room_name,
+                    dispatch_id = NULL,
+                    status = 'dispatching',
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = EXCLUDED.updated_at
+            """,
+            request.room_name,
+            request.agent_type,
+            transcript_room_name,
+            json.dumps(metadata_dict, ensure_ascii=False),
+            now)
 
     lkapi = None
     try:
@@ -273,7 +295,7 @@ async def health_check():
         active_count = await conn.fetchval("""
             SELECT COUNT(*)
             FROM agent_jobs
-            WHERE status IN ('pending', 'running')
+            WHERE status IN ('dispatching', 'pending', 'running')
         """)
 
     return {
