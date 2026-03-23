@@ -526,26 +526,43 @@ async def entrypoint(ctx: agents.JobContext):
 
         shutdown_event = asyncio.Event()
         last_human_seen_at = time.monotonic()
+        saw_human_disconnect = False
 
         room_on = getattr(ctx.room, "on", None)
         if callable(room_on):
             @ctx.room.on("participant_connected")
             def _participant_connected(participant):
+                nonlocal saw_human_disconnect
                 logger.info(
                     "participant_connected room=%s identity=%s kind=%s",
                     room_name,
                     getattr(participant, "identity", "unknown"),
                     getattr(participant, "kind", "unknown"),
                 )
+                if (
+                    getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+                    and saw_human_disconnect
+                ):
+                    # On browser refresh/rejoin, force a clean agent restart so media subscriptions
+                    # are rebuilt against the new client track graph.
+                    logger.info(
+                        "human_reconnected_restart room=%s identity=%s",
+                        room_name,
+                        getattr(participant, "identity", "unknown"),
+                    )
+                    ctx.shutdown("human_reconnected_restart")
 
             @ctx.room.on("participant_disconnected")
             def _participant_disconnected(participant):
+                nonlocal saw_human_disconnect
                 logger.info(
                     "participant_disconnected room=%s identity=%s kind=%s",
                     room_name,
                     getattr(participant, "identity", "unknown"),
                     getattr(participant, "kind", "unknown"),
                 )
+                if getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+                    saw_human_disconnect = True
 
         async def _monitor_no_human_participants():
             nonlocal last_human_seen_at
