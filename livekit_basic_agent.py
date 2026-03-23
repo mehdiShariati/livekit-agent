@@ -297,6 +297,22 @@ def count_standard_participants(room: rtc.Room) -> int:
     return count
 
 
+def has_active_human_audio(room: rtc.Room) -> bool:
+    """
+    True when at least one STANDARD remote participant currently has an audio publication.
+    This is stronger than participant count and helps detect stale reconnect states.
+    """
+    for participant in room.remote_participants.values():
+        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+            continue
+        pubs = getattr(participant, "track_publications", None) or {}
+        for pub in pubs.values():
+            kind = getattr(pub, "kind", None)
+            if kind == rtc.TrackKind.KIND_AUDIO:
+                return True
+    return False
+
+
 async def wait_for_stale_agents_to_leave(
     room: rtc.Room,
     *,
@@ -511,18 +527,41 @@ async def entrypoint(ctx: agents.JobContext):
         shutdown_event = asyncio.Event()
         last_human_seen_at = time.monotonic()
 
+        room_on = getattr(ctx.room, "on", None)
+        if callable(room_on):
+            @ctx.room.on("participant_connected")
+            def _participant_connected(participant):
+                logger.info(
+                    "participant_connected room=%s identity=%s kind=%s",
+                    room_name,
+                    getattr(participant, "identity", "unknown"),
+                    getattr(participant, "kind", "unknown"),
+                )
+
+            @ctx.room.on("participant_disconnected")
+            def _participant_disconnected(participant):
+                logger.info(
+                    "participant_disconnected room=%s identity=%s kind=%s",
+                    room_name,
+                    getattr(participant, "identity", "unknown"),
+                    getattr(participant, "kind", "unknown"),
+                )
+
         async def _monitor_no_human_participants():
             nonlocal last_human_seen_at
             while not shutdown_event.is_set():
                 humans = count_standard_participants(ctx.room)
+                has_audio = has_active_human_audio(ctx.room)
                 now = time.monotonic()
-                if humans > 0:
+                if humans > 0 and has_audio:
                     last_human_seen_at = now
                 elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
                     logger.info(
-                        "no_human_participants_shutdown room=%s grace_s=%.1f",
+                        "no_human_participants_shutdown room=%s grace_s=%.1f humans=%s has_audio=%s",
                         room_name,
                         NO_HUMAN_GRACE_SECONDS,
+                        humans,
+                        has_audio,
                     )
                     ctx.shutdown("no_human_participants")
                     return
