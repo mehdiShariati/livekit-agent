@@ -154,6 +154,8 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
 
     lesson_topic = clean_text(config.get("lesson_topic"), "General speaking practice")
     lesson_goal = clean_text(config.get("lesson_goal"), "Help the learner practice effectively")
+    selected_goal = clean_text(config.get("selected_goal"), "")
+    goal_focus = clean_text(config.get("goal_focus"), "")
     learner_interests_text = clean_text(config.get("learner_interests_text"), "Not provided")
     learner_strengths_text = clean_text(config.get("learner_strengths_text"), "Not provided")
     learner_weaknesses_text = clean_text(config.get("learner_weaknesses_text"), "Not provided")
@@ -178,10 +180,19 @@ Learner profile:
 - Interests: {learner_interests_text}
 - Strengths: {learner_strengths_text}
 - Weaknesses: {learner_weaknesses_text}
+- Selected goal: {selected_goal or "Not provided"}
+- Goal focus: {goal_focus or "Not provided"}
 
 Lesson context:
 - Topic: {lesson_topic}
 - Goal: {lesson_goal}
+
+Goal behavior:
+- Keep the conversation centered on the learner's selected goal.
+- Encourage the learner to speak continuously and comfortably.
+- During onboarding assessment, aim for at least 3 minutes of learner speaking for better accuracy.
+- If selected goal exists, the first two questions MUST be about that goal (not generic small talk).
+- Keep each question open-ended so the learner speaks longer answers.
 
 Language policy:
 {language_policy(native_language, target_language, learner_level)}
