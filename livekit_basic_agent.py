@@ -144,10 +144,13 @@ def static_safety_rules() -> str:
 
 def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
     native_language = clean_text(config.get("native_language"), "English")
-    target_language = clean_text(config.get("target_language"), "English")
+    target_language = clean_text(
+        config.get("target_language") or config.get("learning_language"),
+        "English",
+    )
     speaking_language = clean_text(config.get("speaking_language"), target_language or "English")
     assessment_type = clean_text(config.get("assessment_type"), "")
-    learner_level = normalize_level(clean_text(config.get("learner_level"), "A1"))
+    learner_level = normalize_level(clean_text(config.get("learner_level") or config.get("user_level"), "A1"))
 
     lesson_topic = clean_text(config.get("lesson_topic"), "General speaking practice")
     lesson_goal = clean_text(config.get("lesson_goal"), "Help the learner practice effectively")
@@ -495,7 +498,13 @@ async def entrypoint(ctx: agents.JobContext):
             return
 
         system_prompt = build_system_prompt(agent_type, config)
-        opening_line = clean_text(config.get("opening_line"), "Hello. Let's continue from where we left off.")
+        opening_line = clean_text(config.get("opening_line"), "")
+        if not opening_line:
+            opening_line = (
+                f"First assistant message only: greet warmly in {clean_text(config.get('native_language'), 'English')}. "
+                f"Then continue in {clean_text(config.get('target_language') or config.get('learning_language'), 'English')}. "
+                "Keep it short and friendly."
+            )
         voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
 
         # Only the lock owner reaches here
@@ -512,9 +521,54 @@ async def entrypoint(ctx: agents.JobContext):
         max_restarts_after_cleanup = int(os.getenv("MAX_RESTARTS_AFTER_CLEANUP", "1"))
         restart_count = 0
 
+        # These refs are shared across the optional restart loop below.
+        # Key point: register room event handlers only once, otherwise every restart
+        # iteration would attach another listener and logs/shutdown would duplicate.
+        current_shutdown_event: Optional[asyncio.Event] = None
+        shutdown_reason_ref: Optional[str] = None
+        saw_human_disconnect = False
+        did_add_shutdown_callback = False
+
+        room_on = getattr(ctx.room, "on", None)
+        if callable(room_on):
+            @ctx.room.on("participant_connected")
+            def _participant_connected(participant):
+                nonlocal saw_human_disconnect, shutdown_reason_ref, current_shutdown_event
+                p_kind = getattr(participant, "kind", "unknown")
+                logger.info(
+                    "participant_connected room=%s identity=%s kind=%s",
+                    room_name,
+                    getattr(participant, "identity", "unknown"),
+                    p_kind,
+                )
+
+                if _is_standard_kind(p_kind) and saw_human_disconnect:
+                    logger.info(
+                        "human_reconnected_restart room=%s identity=%s",
+                        room_name,
+                        getattr(participant, "identity", "unknown"),
+                    )
+                    shutdown_reason_ref = "human_reconnected_restart"
+                    saw_human_disconnect = False
+                    if current_shutdown_event is not None:
+                        current_shutdown_event.set()
+
+            @ctx.room.on("participant_disconnected")
+            def _participant_disconnected(participant):
+                nonlocal saw_human_disconnect
+                p_kind = getattr(participant, "kind", "unknown")
+                logger.info(
+                    "participant_disconnected room=%s identity=%s kind=%s",
+                    room_name,
+                    getattr(participant, "identity", "unknown"),
+                    p_kind,
+                )
+                if _is_standard_kind(p_kind):
+                    saw_human_disconnect = True
+
         while True:
             did_iteration_cleanup = False
-            shutdown_reason: Optional[str] = None
+            shutdown_reason_ref = None
 
             session = AgentSession(
                 stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
@@ -539,47 +593,12 @@ async def entrypoint(ctx: agents.JobContext):
             await runtime.send_opening(opening_line)
 
             shutdown_event = asyncio.Event()
+            current_shutdown_event = shutdown_event
             last_human_seen_at = time.monotonic()
             saw_human_disconnect = False
 
-            room_on = getattr(ctx.room, "on", None)
-            if callable(room_on):
-                @ctx.room.on("participant_connected")
-                def _participant_connected(participant):
-                    nonlocal saw_human_disconnect, shutdown_reason
-                    p_kind = getattr(participant, "kind", "unknown")
-                    logger.info(
-                        "participant_connected room=%s identity=%s kind=%s",
-                        room_name,
-                        getattr(participant, "identity", "unknown"),
-                        p_kind,
-                    )
-                    if _is_standard_kind(p_kind) and saw_human_disconnect:
-                        # Clean rebuild: close this session and start a fresh one
-                        # against the current track graph.
-                        logger.info(
-                            "human_reconnected_restart room=%s identity=%s",
-                            room_name,
-                            getattr(participant, "identity", "unknown"),
-                        )
-                        shutdown_reason = "human_reconnected_restart"
-                        shutdown_event.set()
-
-                @ctx.room.on("participant_disconnected")
-                def _participant_disconnected(participant):
-                    nonlocal saw_human_disconnect
-                    p_kind = getattr(participant, "kind", "unknown")
-                    logger.info(
-                        "participant_disconnected room=%s identity=%s kind=%s",
-                        room_name,
-                        getattr(participant, "identity", "unknown"),
-                        p_kind,
-                    )
-                    if _is_standard_kind(p_kind):
-                        saw_human_disconnect = True
-
             async def _monitor_no_human_participants():
-                nonlocal last_human_seen_at, shutdown_reason
+                nonlocal last_human_seen_at, shutdown_reason_ref
                 while not shutdown_event.is_set():
                     humans = count_standard_participants(ctx.room)
                     has_audio = has_active_human_audio(ctx.room)
@@ -594,7 +613,7 @@ async def entrypoint(ctx: agents.JobContext):
                             humans,
                             has_audio,
                         )
-                        shutdown_reason = "no_human_participants"
+                        shutdown_reason_ref = "no_human_participants"
                         shutdown_event.set()
                         return
                     await asyncio.sleep(NO_HUMAN_POLL_SECONDS)
@@ -602,22 +621,22 @@ async def entrypoint(ctx: agents.JobContext):
             async def _on_shutdown():
                 try:
                     logger.info("ctx shutdown callback triggered room=%s", room_name)
-                    shutdown_event.set()
+                    # ctx.shutdown can happen from external reasons; always signal current iteration.
+                    if current_shutdown_event is not None:
+                        current_shutdown_event.set()
                 except Exception:
                     logger.exception("shutdown callback failed room=%s", room_name)
 
             add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
-            no_human_monitor_task = None
-            if callable(add_shutdown_callback):
+            if callable(add_shutdown_callback) and not did_add_shutdown_callback:
                 add_shutdown_callback(_on_shutdown)
-                no_human_monitor_task = asyncio.create_task(
-                    _monitor_no_human_participants(),
-                    name="no-human-participants-monitor",
-                )
-                await shutdown_event.wait()
-            else:
-                while True:
-                    await asyncio.sleep(2.0)
+                did_add_shutdown_callback = True
+
+            no_human_monitor_task = asyncio.create_task(
+                _monitor_no_human_participants(),
+                name="no-human-participants-monitor",
+            )
+            await shutdown_event.wait()
 
             # Cleanup this iteration.
             logger.info("agent_cleanup_start room=%s", room_name)
@@ -639,14 +658,15 @@ async def entrypoint(ctx: agents.JobContext):
             did_iteration_cleanup = True
             logger.info("agent_cleanup_done room=%s", room_name)
 
+            current_shutdown_event = None
             humans = count_standard_participants(ctx.room)
-            if shutdown_reason is not None and humans > 0 and restart_count < max_restarts_after_cleanup:
+            if shutdown_reason_ref is not None and humans > 0 and restart_count < max_restarts_after_cleanup:
                 restart_count += 1
                 logger.info(
                     "agent_restart_after_cleanup room=%s humans=%s reason=%s restart_count=%s",
                     room_name,
                     humans,
-                    shutdown_reason,
+                    shutdown_reason_ref,
                     restart_count,
                 )
                 continue
