@@ -32,6 +32,8 @@ REPLY_TIMEOUT_SECONDS = float(os.getenv("REPLY_TIMEOUT_SECONDS", "20"))
 STALE_AGENT_WAIT_SECONDS = float(os.getenv("STALE_AGENT_WAIT_SECONDS", "3.5"))
 STALE_AGENT_POLL_SECONDS = float(os.getenv("STALE_AGENT_POLL_SECONDS", "0.35"))
 MAX_CONCURRENT_LLM_CALLS = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "1"))
+NO_HUMAN_GRACE_SECONDS = float(os.getenv("NO_HUMAN_GRACE_SECONDS", "15"))
+NO_HUMAN_POLL_SECONDS = float(os.getenv("NO_HUMAN_POLL_SECONDS", "0.5"))
 
 ALLOWED_SOURCES = {"zabano", "rockonlearn"}
 
@@ -287,6 +289,14 @@ def count_remote_agents(room: rtc.Room) -> int:
     return count
 
 
+def count_standard_participants(room: rtc.Room) -> int:
+    count = 0
+    for participant in room.remote_participants.values():
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+            count += 1
+    return count
+
+
 async def wait_for_stale_agents_to_leave(
     room: rtc.Room,
     *,
@@ -425,6 +435,7 @@ async def entrypoint(ctx: agents.JobContext):
     runtime = ReplyOrchestrator()
     room_name = "unknown"
     room_lock: Optional[PgRoomLock] = None
+    no_human_monitor_task: Optional[asyncio.Task] = None
 
     try:
         if hasattr(ctx.job, "metadata") and ctx.job.metadata:
@@ -498,6 +509,24 @@ async def entrypoint(ctx: agents.JobContext):
         await runtime.send_opening(opening_line)
 
         shutdown_event = asyncio.Event()
+        last_human_seen_at = time.monotonic()
+
+        async def _monitor_no_human_participants():
+            nonlocal last_human_seen_at
+            while not shutdown_event.is_set():
+                humans = count_standard_participants(ctx.room)
+                now = time.monotonic()
+                if humans > 0:
+                    last_human_seen_at = now
+                elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
+                    logger.info(
+                        "no_human_participants_shutdown room=%s grace_s=%.1f",
+                        room_name,
+                        NO_HUMAN_GRACE_SECONDS,
+                    )
+                    ctx.shutdown("no_human_participants")
+                    return
+                await asyncio.sleep(NO_HUMAN_POLL_SECONDS)
 
         async def _on_shutdown():
             try:
@@ -509,6 +538,10 @@ async def entrypoint(ctx: agents.JobContext):
         add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
         if callable(add_shutdown_callback):
             add_shutdown_callback(_on_shutdown)
+            no_human_monitor_task = asyncio.create_task(
+                _monitor_no_human_participants(),
+                name="no-human-participants-monitor",
+            )
             await shutdown_event.wait()
         else:
             while True:
@@ -525,6 +558,11 @@ async def entrypoint(ctx: agents.JobContext):
 
         with contextlib.suppress(Exception):
             await runtime.stop()
+
+        if no_human_monitor_task is not None:
+            no_human_monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await no_human_monitor_task
 
         if session is not None:
             close_method = getattr(session, "aclose", None)
