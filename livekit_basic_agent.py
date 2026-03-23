@@ -295,6 +295,111 @@ class PgRoomLock:
             self.lock_acquired = False
 
 
+class ChatLogWriter:
+    """
+    Best-effort writer for `chat_logs`.
+    Stores user STT + agent spoken text (from transcription events).
+    """
+
+    def __init__(self, room_name: str, onboarding_session_id: str = ""):
+        self.room_name = room_name
+        self.onboarding_session_id = (onboarding_session_id or "").strip()
+        self.conn: Optional[asyncpg.Connection] = None
+        self._lock = asyncio.Lock()
+        self._last_line: Optional[tuple[str, str]] = None
+
+    async def connect(self) -> None:
+        if self.conn is not None:
+            return
+        postgres_url = os.getenv("POSTGRES_URL")
+        if not postgres_url:
+            logger.warning("chatlog_postgres_url_missing room=%s", self.room_name)
+            return
+        try:
+            self.conn = await asyncpg.connect(dsn=postgres_url)
+        except Exception:
+            logger.exception("chatlog_connect_failed room=%s", self.room_name)
+            self.conn = None
+
+    async def close(self) -> None:
+        if self.conn is None:
+            return
+        with contextlib.suppress(Exception):
+            await self.conn.close()
+        self.conn = None
+
+    async def write(self, role: str, text: str) -> None:
+        role = clean_text(role, "user").lower()
+        text = clean_text(text)
+        if not text:
+            return
+        if len(text) > 4000:
+            text = text[:4000]
+
+        # Skip immediate duplicates (common with partial transcript event bursts).
+        line_key = (role, text)
+        if self._last_line == line_key:
+            return
+
+        await self.connect()
+        if self.conn is None:
+            return
+
+        async with self._lock:
+            if self.conn is None:
+                return
+            try:
+                if self.onboarding_session_id:
+                    await self.conn.execute(
+                        """
+                        INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        self.room_name,
+                        role,
+                        text,
+                        self.onboarding_session_id,
+                    )
+                else:
+                    await self.conn.execute(
+                        """
+                        INSERT INTO chat_logs (room_name, role, message)
+                        VALUES ($1, $2, $3)
+                        """,
+                        self.room_name,
+                        role,
+                        text,
+                    )
+                self._last_line = line_key
+            except Exception:
+                # Backward compatibility for schemas that use `content` or don't have onboarding_session_id.
+                try:
+                    if self.onboarding_session_id:
+                        await self.conn.execute(
+                            """
+                            INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
+                            VALUES ($1, $2, $3, $4)
+                            """,
+                            self.room_name,
+                            role,
+                            text,
+                            self.onboarding_session_id,
+                        )
+                    else:
+                        await self.conn.execute(
+                            """
+                            INSERT INTO chat_logs (room_name, role, content)
+                            VALUES ($1, $2, $3)
+                            """,
+                            self.room_name,
+                            role,
+                            text,
+                        )
+                    self._last_line = line_key
+                except Exception:
+                    logger.exception("chatlog_insert_failed room=%s role=%s", self.room_name, role)
+
+
 def count_remote_agents(room: rtc.Room) -> int:
     count = 0
     for participant in room.remote_participants.values():
@@ -471,7 +576,9 @@ async def entrypoint(ctx: agents.JobContext):
     session: Optional[AgentSession] = None
     runtime: Optional[ReplyOrchestrator] = None
     room_name = "unknown"
+    onboarding_session_id = ""
     room_lock: Optional[PgRoomLock] = None
+    chatlog_writer: Optional[ChatLogWriter] = None
     no_human_monitor_task: Optional[asyncio.Task] = None
     did_iteration_cleanup = False
 
@@ -494,6 +601,10 @@ async def entrypoint(ctx: agents.JobContext):
         config = metadata.get("config") or {}
         if not isinstance(config, dict):
             config = {}
+        onboarding_session_id = clean_text(
+            config.get("onboarding_session_id") or metadata.get("onboarding_session_id"),
+            "",
+        )
 
         # IMPORTANT: get room key from metadata BEFORE ctx.connect()
         room_name = clean_text(
@@ -522,6 +633,7 @@ async def entrypoint(ctx: agents.JobContext):
         await ctx.connect()
         room_name = getattr(ctx.room, "name", room_name)
         logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
+        chatlog_writer = ChatLogWriter(room_name=room_name, onboarding_session_id=onboarding_session_id)
 
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
         if stale_count > 0:
@@ -542,6 +654,23 @@ async def entrypoint(ctx: agents.JobContext):
 
         room_on = getattr(ctx.room, "on", None)
         if callable(room_on):
+            @ctx.room.on("transcription_received")
+            def _transcription_received(transcriptions, participant, publication):
+                if chatlog_writer is None:
+                    return
+                p = participant
+                if p is None:
+                    return
+                role = "assistant" if getattr(p, "is_agent", False) or getattr(p, "isAgent", False) else "user"
+                try:
+                    for item in transcriptions or []:
+                        text = clean_text(getattr(item, "text", ""))
+                        if not text:
+                            continue
+                        asyncio.create_task(chatlog_writer.write(role, text))
+                except Exception:
+                    logger.exception("transcription_received_handler_failed room=%s", room_name)
+
             @ctx.room.on("participant_connected")
             def _participant_connected(participant):
                 nonlocal saw_human_disconnect, shutdown_reason_ref, current_shutdown_event
@@ -602,6 +731,8 @@ async def entrypoint(ctx: agents.JobContext):
             runtime = ReplyOrchestrator()
             await runtime.start(session)
             await runtime.send_opening(opening_line)
+            if chatlog_writer is not None:
+                await chatlog_writer.write("assistant", opening_line)
 
             shutdown_event = asyncio.Event()
             current_shutdown_event = shutdown_event
@@ -665,6 +796,9 @@ async def entrypoint(ctx: agents.JobContext):
                 if close_method is not None:
                     with contextlib.suppress(Exception):
                         await close_method()
+            if chatlog_writer is not None:
+                with contextlib.suppress(Exception):
+                    await chatlog_writer.close()
 
             did_iteration_cleanup = True
             logger.info("agent_cleanup_done room=%s", room_name)
@@ -707,6 +841,9 @@ async def entrypoint(ctx: agents.JobContext):
                 if close_method is not None:
                     with contextlib.suppress(Exception):
                         await close_method()
+            if chatlog_writer is not None:
+                with contextlib.suppress(Exception):
+                    await chatlog_writer.close()
 
             logger.info("agent_cleanup_done room=%s", room_name)
 
