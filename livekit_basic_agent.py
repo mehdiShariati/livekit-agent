@@ -821,10 +821,23 @@ async def entrypoint(ctx: agents.JobContext):
                 try:
                     @session.on("user_speech_committed")
                     def _on_user_speech_committed(ev):
+                        logger.info("chatlog_event session=user_speech_committed room=%s", room_name)
                         _queue_chatlog("user", ev)
 
                     @session.on("agent_speech_committed")
                     def _on_agent_speech_committed(ev):
+                        logger.info("chatlog_event session=agent_speech_committed room=%s", room_name)
+                        _queue_chatlog("assistant", ev)
+
+                    # Compatibility with newer/alternate LiveKit event names.
+                    @session.on("input_speech_committed")
+                    def _on_input_speech_committed(ev):
+                        logger.info("chatlog_event session=input_speech_committed room=%s", room_name)
+                        _queue_chatlog("user", ev)
+
+                    @session.on("output_speech_committed")
+                    def _on_output_speech_committed(ev):
+                        logger.info("chatlog_event session=output_speech_committed room=%s", room_name)
                         _queue_chatlog("assistant", ev)
                 except Exception:
                     logger.exception("session_chatlog_event_bind_failed room=%s", room_name)
