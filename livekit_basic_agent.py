@@ -455,10 +455,11 @@ class ReplyOrchestrator:
 async def entrypoint(ctx: agents.JobContext):
     metadata: dict[str, Any] = {}
     session: Optional[AgentSession] = None
-    runtime = ReplyOrchestrator()
+    runtime: Optional[ReplyOrchestrator] = None
     room_name = "unknown"
     room_lock: Optional[PgRoomLock] = None
     no_human_monitor_task: Optional[asyncio.Task] = None
+    did_iteration_cleanup = False
 
     try:
         if hasattr(ctx.job, "metadata") and ctx.job.metadata:
@@ -508,107 +509,149 @@ async def entrypoint(ctx: agents.JobContext):
             ctx.shutdown("room_already_has_agent")
             return
 
-        session = AgentSession(
-            stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
-            llm=openai.LLM(
-                model=DEFAULT_LLM,
-                max_retries=1,
-                timeout=15,
-            ),
-            tts=openai.TTS(voice=voice),
-            vad=get_vad(),
-        )
+        max_restarts_after_cleanup = int(os.getenv("MAX_RESTARTS_AFTER_CLEANUP", "1"))
+        restart_count = 0
 
-        assistant = DynamicAssistant(instructions=system_prompt)
+        while True:
+            did_iteration_cleanup = False
+            shutdown_reason: Optional[str] = None
 
-        await session.start(
-            room=ctx.room,
-            agent=assistant,
-        )
+            session = AgentSession(
+                stt=CustomWhisperSTT(model=DEFAULT_STT_MODEL),
+                llm=openai.LLM(
+                    model=DEFAULT_LLM,
+                    max_retries=1,
+                    timeout=15,
+                ),
+                tts=openai.TTS(voice=voice),
+                vad=get_vad(),
+            )
+            assistant = DynamicAssistant(instructions=system_prompt)
 
-        logger.info("agent_started room=%s", room_name)
+            await session.start(
+                room=ctx.room,
+                agent=assistant,
+            )
+            logger.info("agent_started room=%s", room_name)
 
-        await runtime.start(session)
-        await runtime.send_opening(opening_line)
+            runtime = ReplyOrchestrator()
+            await runtime.start(session)
+            await runtime.send_opening(opening_line)
 
-        shutdown_event = asyncio.Event()
-        last_human_seen_at = time.monotonic()
-        saw_human_disconnect = False
+            shutdown_event = asyncio.Event()
+            last_human_seen_at = time.monotonic()
+            saw_human_disconnect = False
 
-        room_on = getattr(ctx.room, "on", None)
-        if callable(room_on):
-            @ctx.room.on("participant_connected")
-            def _participant_connected(participant):
-                nonlocal saw_human_disconnect
-                p_kind = getattr(participant, "kind", "unknown")
-                logger.info(
-                    "participant_connected room=%s identity=%s kind=%s",
-                    room_name,
-                    getattr(participant, "identity", "unknown"),
-                    p_kind,
-                )
-                if _is_standard_kind(p_kind) and saw_human_disconnect:
-                    # On browser refresh/rejoin, force a clean agent restart so media subscriptions
-                    # are rebuilt against the new client track graph.
+            room_on = getattr(ctx.room, "on", None)
+            if callable(room_on):
+                @ctx.room.on("participant_connected")
+                def _participant_connected(participant):
+                    nonlocal saw_human_disconnect, shutdown_reason
+                    p_kind = getattr(participant, "kind", "unknown")
                     logger.info(
-                        "human_reconnected_restart room=%s identity=%s",
+                        "participant_connected room=%s identity=%s kind=%s",
                         room_name,
                         getattr(participant, "identity", "unknown"),
+                        p_kind,
                     )
-                    ctx.shutdown("human_reconnected_restart")
-                    shutdown_event.set()
+                    if _is_standard_kind(p_kind) and saw_human_disconnect:
+                        # Clean rebuild: close this session and start a fresh one
+                        # against the current track graph.
+                        logger.info(
+                            "human_reconnected_restart room=%s identity=%s",
+                            room_name,
+                            getattr(participant, "identity", "unknown"),
+                        )
+                        shutdown_reason = "human_reconnected_restart"
+                        shutdown_event.set()
 
-            @ctx.room.on("participant_disconnected")
-            def _participant_disconnected(participant):
-                nonlocal saw_human_disconnect
-                p_kind = getattr(participant, "kind", "unknown")
-                logger.info(
-                    "participant_disconnected room=%s identity=%s kind=%s",
-                    room_name,
-                    getattr(participant, "identity", "unknown"),
-                    p_kind,
-                )
-                if _is_standard_kind(p_kind):
-                    saw_human_disconnect = True
-
-        async def _monitor_no_human_participants():
-            nonlocal last_human_seen_at
-            while not shutdown_event.is_set():
-                humans = count_standard_participants(ctx.room)
-                has_audio = has_active_human_audio(ctx.room)
-                now = time.monotonic()
-                if humans > 0 and has_audio:
-                    last_human_seen_at = now
-                elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
+                @ctx.room.on("participant_disconnected")
+                def _participant_disconnected(participant):
+                    nonlocal saw_human_disconnect
+                    p_kind = getattr(participant, "kind", "unknown")
                     logger.info(
-                        "no_human_participants_shutdown room=%s grace_s=%.1f humans=%s has_audio=%s",
+                        "participant_disconnected room=%s identity=%s kind=%s",
                         room_name,
-                        NO_HUMAN_GRACE_SECONDS,
-                        humans,
-                        has_audio,
+                        getattr(participant, "identity", "unknown"),
+                        p_kind,
                     )
-                    ctx.shutdown("no_human_participants")
-                    return
-                await asyncio.sleep(NO_HUMAN_POLL_SECONDS)
+                    if _is_standard_kind(p_kind):
+                        saw_human_disconnect = True
 
-        async def _on_shutdown():
-            try:
-                logger.info("ctx shutdown callback triggered room=%s", room_name)
-                shutdown_event.set()
-            except Exception:
-                logger.exception("shutdown callback failed room=%s", room_name)
+            async def _monitor_no_human_participants():
+                nonlocal last_human_seen_at, shutdown_reason
+                while not shutdown_event.is_set():
+                    humans = count_standard_participants(ctx.room)
+                    has_audio = has_active_human_audio(ctx.room)
+                    now = time.monotonic()
+                    if humans > 0 and has_audio:
+                        last_human_seen_at = now
+                    elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
+                        logger.info(
+                            "no_human_participants_shutdown room=%s grace_s=%.1f humans=%s has_audio=%s",
+                            room_name,
+                            NO_HUMAN_GRACE_SECONDS,
+                            humans,
+                            has_audio,
+                        )
+                        shutdown_reason = "no_human_participants"
+                        shutdown_event.set()
+                        return
+                    await asyncio.sleep(NO_HUMAN_POLL_SECONDS)
 
-        add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
-        if callable(add_shutdown_callback):
-            add_shutdown_callback(_on_shutdown)
-            no_human_monitor_task = asyncio.create_task(
-                _monitor_no_human_participants(),
-                name="no-human-participants-monitor",
-            )
-            await shutdown_event.wait()
-        else:
-            while True:
-                await asyncio.sleep(2.0)
+            async def _on_shutdown():
+                try:
+                    logger.info("ctx shutdown callback triggered room=%s", room_name)
+                    shutdown_event.set()
+                except Exception:
+                    logger.exception("shutdown callback failed room=%s", room_name)
+
+            add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
+            no_human_monitor_task = None
+            if callable(add_shutdown_callback):
+                add_shutdown_callback(_on_shutdown)
+                no_human_monitor_task = asyncio.create_task(
+                    _monitor_no_human_participants(),
+                    name="no-human-participants-monitor",
+                )
+                await shutdown_event.wait()
+            else:
+                while True:
+                    await asyncio.sleep(2.0)
+
+            # Cleanup this iteration.
+            logger.info("agent_cleanup_start room=%s", room_name)
+            with contextlib.suppress(Exception):
+                if runtime is not None:
+                    await runtime.stop()
+
+            if no_human_monitor_task is not None:
+                no_human_monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await no_human_monitor_task
+
+            if session is not None:
+                close_method = getattr(session, "aclose", None)
+                if close_method is not None:
+                    with contextlib.suppress(Exception):
+                        await close_method()
+
+            did_iteration_cleanup = True
+            logger.info("agent_cleanup_done room=%s", room_name)
+
+            humans = count_standard_participants(ctx.room)
+            if shutdown_reason is not None and humans > 0 and restart_count < max_restarts_after_cleanup:
+                restart_count += 1
+                logger.info(
+                    "agent_restart_after_cleanup room=%s humans=%s reason=%s restart_count=%s",
+                    room_name,
+                    humans,
+                    shutdown_reason,
+                    restart_count,
+                )
+                continue
+
+            break
 
     except asyncio.CancelledError:
         logger.warning("agent_cancelled room=%s", room_name)
@@ -617,27 +660,28 @@ async def entrypoint(ctx: agents.JobContext):
         logger.exception("agent_error room=%s error=%s", room_name, e)
         raise
     finally:
-        logger.info("agent_cleanup_start room=%s", room_name)
+        if not did_iteration_cleanup:
+            logger.info("agent_cleanup_start room=%s", room_name)
+            with contextlib.suppress(Exception):
+                if runtime is not None:
+                    await runtime.stop()
 
-        with contextlib.suppress(Exception):
-            await runtime.stop()
+            if no_human_monitor_task is not None:
+                no_human_monitor_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await no_human_monitor_task
 
-        if no_human_monitor_task is not None:
-            no_human_monitor_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await no_human_monitor_task
+            if session is not None:
+                close_method = getattr(session, "aclose", None)
+                if close_method is not None:
+                    with contextlib.suppress(Exception):
+                        await close_method()
 
-        if session is not None:
-            close_method = getattr(session, "aclose", None)
-            if close_method is not None:
-                with contextlib.suppress(Exception):
-                    await close_method()
+            logger.info("agent_cleanup_done room=%s", room_name)
 
         if room_lock is not None:
             with contextlib.suppress(Exception):
                 await room_lock.release()
-
-        logger.info("agent_cleanup_done room=%s", room_name)
 
 
 # if __name__ == "__main__":
