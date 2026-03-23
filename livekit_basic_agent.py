@@ -621,6 +621,7 @@ async def entrypoint(ctx: agents.JobContext):
     room_lock: Optional[PgRoomLock] = None
     chatlog_writer: Optional[ChatLogWriter] = None
     no_human_monitor_task: Optional[asyncio.Task] = None
+    chatlog_poll_task: Optional[asyncio.Task] = None
     did_iteration_cleanup = False
 
     try:
@@ -816,9 +817,140 @@ async def entrypoint(ctx: agents.JobContext):
                     return
                 asyncio.create_task(chatlog_writer.write(role, text))
 
+            # Fallback source: poll session chat context and persist unseen lines.
+            # This avoids hard dependency on specific transcription event names.
+            seen_chatlog_lines: set[tuple[str, str]] = set()
+
+            def _normalize_role(role_value: Any) -> str:
+                role_text = clean_text(role_value, "user").lower()
+                if role_text in {"assistant", "agent", "ai", "system", "bot", "tutor"}:
+                    return "assistant"
+                return "user"
+
+            def _extract_message_text(message_obj: Any) -> str:
+                if message_obj is None:
+                    return ""
+                if isinstance(message_obj, str):
+                    return clean_text(message_obj, "")
+                for key in ("text", "content", "transcript", "message"):
+                    val = getattr(message_obj, key, None)
+                    if isinstance(val, str) and val.strip():
+                        return clean_text(val, "")
+                    if isinstance(message_obj, dict):
+                        dval = message_obj.get(key)
+                        if isinstance(dval, str) and dval.strip():
+                            return clean_text(dval, "")
+                        if isinstance(dval, list):
+                            parts: list[str] = []
+                            for item in dval:
+                                if isinstance(item, str):
+                                    if item.strip():
+                                        parts.append(item.strip())
+                                elif isinstance(item, dict):
+                                    part = item.get("text") or item.get("content")
+                                    if isinstance(part, str) and part.strip():
+                                        parts.append(part.strip())
+                            if parts:
+                                return clean_text(" ".join(parts), "")
+                return ""
+
+            async def _poll_session_chatlog_context():
+                warned_missing_ctx = False
+                while True:
+                    if shutdown_event.is_set():
+                        return
+                    if chatlog_writer is None:
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    messages = None
+                    for attr in ("chat_ctx", "chat_context", "history", "conversation", "messages"):
+                        ctx_obj = getattr(session, attr, None)
+                        if ctx_obj is None:
+                            continue
+                        if isinstance(ctx_obj, list):
+                            messages = ctx_obj
+                            break
+                        inner_messages = getattr(ctx_obj, "messages", None)
+                        if isinstance(inner_messages, list):
+                            messages = inner_messages
+                            break
+
+                    if not messages:
+                        if not warned_missing_ctx:
+                            logger.info("chatlog_fallback_no_messages_source room=%s", room_name)
+                            warned_missing_ctx = True
+                        await asyncio.sleep(1.0)
+                        continue
+
+                    for msg in messages:
+                        role = _normalize_role(
+                            getattr(msg, "role", None) if not isinstance(msg, dict) else msg.get("role")
+                        )
+                        text = _extract_message_text(msg)
+                        if not text:
+                            continue
+                        line_key = (role, text)
+                        if line_key in seen_chatlog_lines:
+                            continue
+                        seen_chatlog_lines.add(line_key)
+                        await chatlog_writer.write(role, text)
+
+                    await asyncio.sleep(1.0)
+
             session_on = getattr(session, "on", None)
             if callable(session_on):
                 try:
+                    def _extract_conversation_item(ev: Any) -> tuple[str, str]:
+                        item = getattr(ev, "item", None)
+                        if item is None and isinstance(ev, dict):
+                            item = ev.get("item")
+                        if item is None:
+                            return ("user", "")
+
+                        role_raw = (
+                            getattr(item, "role", None)
+                            if not isinstance(item, dict)
+                            else item.get("role")
+                        )
+                        role = "assistant" if clean_text(role_raw, "user").lower() == "assistant" else "user"
+
+                        content_raw = (
+                            getattr(item, "content", None)
+                            if not isinstance(item, dict)
+                            else item.get("content")
+                        )
+                        if isinstance(content_raw, str):
+                            return (role, clean_text(content_raw, ""))
+                        if isinstance(content_raw, list):
+                            parts: list[str] = []
+                            for chunk in content_raw:
+                                if isinstance(chunk, str):
+                                    if chunk.strip():
+                                        parts.append(chunk.strip())
+                                    continue
+                                if isinstance(chunk, dict):
+                                    text_part = chunk.get("text") or chunk.get("content") or chunk.get("transcript")
+                                else:
+                                    text_part = (
+                                        getattr(chunk, "text", None)
+                                        or getattr(chunk, "content", None)
+                                        or getattr(chunk, "transcript", None)
+                                    )
+                                if isinstance(text_part, str) and text_part.strip():
+                                    parts.append(text_part.strip())
+                            return (role, clean_text(" ".join(parts), ""))
+
+                        return (role, "")
+
+                    @session.on("conversation_item_added")
+                    def _on_conversation_item_added(ev):
+                        role, text = _extract_conversation_item(ev)
+                        if not text:
+                            return
+                        logger.info("chatlog_event session=conversation_item_added room=%s role=%s", room_name, role)
+                        asyncio.create_task(chatlog_writer.write(role, text))
+
                     @session.on("user_speech_committed")
                     def _on_user_speech_committed(ev):
                         logger.info("chatlog_event session=user_speech_committed room=%s", room_name)
@@ -890,6 +1022,10 @@ async def entrypoint(ctx: agents.JobContext):
                 _monitor_no_human_participants(),
                 name="no-human-participants-monitor",
             )
+            chatlog_poll_task = asyncio.create_task(
+                _poll_session_chatlog_context(),
+                name="chatlog-context-poll",
+            )
             await shutdown_event.wait()
 
             # Cleanup this iteration.
@@ -902,6 +1038,10 @@ async def entrypoint(ctx: agents.JobContext):
                 no_human_monitor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await no_human_monitor_task
+            if chatlog_poll_task is not None:
+                chatlog_poll_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await chatlog_poll_task
 
             if session is not None:
                 close_method = getattr(session, "aclose", None)
@@ -947,6 +1087,10 @@ async def entrypoint(ctx: agents.JobContext):
                 no_human_monitor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await no_human_monitor_task
+            if chatlog_poll_task is not None:
+                chatlog_poll_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await chatlog_poll_task
 
             if session is not None:
                 close_method = getattr(session, "aclose", None)
