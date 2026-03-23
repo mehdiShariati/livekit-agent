@@ -289,10 +289,17 @@ def count_remote_agents(room: rtc.Room) -> int:
     return count
 
 
+def _is_standard_kind(kind: Any) -> bool:
+    try:
+        return int(kind) == int(rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD)
+    except Exception:
+        return kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
+
+
 def count_standard_participants(room: rtc.Room) -> int:
     count = 0
     for participant in room.remote_participants.values():
-        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+        if _is_standard_kind(getattr(participant, "kind", None)):
             count += 1
     return count
 
@@ -303,7 +310,7 @@ def has_active_human_audio(room: rtc.Room) -> bool:
     This is stronger than participant count and helps detect stale reconnect states.
     """
     for participant in room.remote_participants.values():
-        if participant.kind != rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+        if not _is_standard_kind(getattr(participant, "kind", None)):
             continue
         pubs = getattr(participant, "track_publications", None) or {}
         for pub in pubs.values():
@@ -533,16 +540,14 @@ async def entrypoint(ctx: agents.JobContext):
             @ctx.room.on("participant_connected")
             def _participant_connected(participant):
                 nonlocal saw_human_disconnect
+                p_kind = getattr(participant, "kind", "unknown")
                 logger.info(
                     "participant_connected room=%s identity=%s kind=%s",
                     room_name,
                     getattr(participant, "identity", "unknown"),
-                    getattr(participant, "kind", "unknown"),
+                    p_kind,
                 )
-                if (
-                    getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD
-                    and saw_human_disconnect
-                ):
+                if _is_standard_kind(p_kind) and saw_human_disconnect:
                     # On browser refresh/rejoin, force a clean agent restart so media subscriptions
                     # are rebuilt against the new client track graph.
                     logger.info(
@@ -551,17 +556,19 @@ async def entrypoint(ctx: agents.JobContext):
                         getattr(participant, "identity", "unknown"),
                     )
                     ctx.shutdown("human_reconnected_restart")
+                    shutdown_event.set()
 
             @ctx.room.on("participant_disconnected")
             def _participant_disconnected(participant):
                 nonlocal saw_human_disconnect
+                p_kind = getattr(participant, "kind", "unknown")
                 logger.info(
                     "participant_disconnected room=%s identity=%s kind=%s",
                     room_name,
                     getattr(participant, "identity", "unknown"),
-                    getattr(participant, "kind", "unknown"),
+                    p_kind,
                 )
-                if getattr(participant, "kind", None) == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+                if _is_standard_kind(p_kind):
                     saw_human_disconnect = True
 
         async def _monitor_no_human_participants():
