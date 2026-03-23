@@ -311,7 +311,11 @@ class ChatLogWriter:
     async def connect(self) -> None:
         if self.conn is not None:
             return
-        postgres_url = os.getenv("POSTGRES_URL")
+        postgres_url = (
+            os.getenv("POSTGRES_URL")
+            or os.getenv("AGENT_POSTGRES_URL")
+            or os.getenv("DATABASE_URL")
+        )
         if not postgres_url:
             logger.warning("chatlog_postgres_url_missing room=%s", self.room_name)
             return
@@ -349,55 +353,92 @@ class ChatLogWriter:
             if self.conn is None:
                 return
             try:
+                role_int = 0 if role == "user" else 1
+                query_attempts: list[tuple[str, tuple[Any, ...]]] = []
                 if self.onboarding_session_id:
-                    await self.conn.execute(
-                        """
-                        INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
-                        VALUES ($1, $2, $3, $4)
-                        """,
-                        self.room_name,
-                        role,
-                        text,
-                        self.onboarding_session_id,
+                    query_attempts.extend(
+                        [
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role, text, self.onboarding_session_id),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role, text, self.onboarding_session_id),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role_int, text, self.onboarding_session_id),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role_int, text, self.onboarding_session_id),
+                            ),
+                        ]
                     )
                 else:
-                    await self.conn.execute(
-                        """
-                        INSERT INTO chat_logs (room_name, role, message)
-                        VALUES ($1, $2, $3)
-                        """,
-                        self.room_name,
-                        role,
-                        text,
+                    query_attempts.extend(
+                        [
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role, text),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role, text),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role_int, text),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role_int, text),
+                            ),
+                        ]
                     )
+
+                last_error: Optional[Exception] = None
+                inserted = False
+                for sql, params in query_attempts:
+                    try:
+                        await self.conn.execute(sql, *params)
+                        inserted = True
+                        break
+                    except Exception as e:
+                        last_error = e
+                        continue
+
+                if not inserted:
+                    raise last_error or RuntimeError("unknown chatlog insert error")
+
                 self._last_line = line_key
-            except Exception:
-                # Backward compatibility for schemas that use `content` or don't have onboarding_session_id.
-                try:
-                    if self.onboarding_session_id:
-                        await self.conn.execute(
-                            """
-                            INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
-                            VALUES ($1, $2, $3, $4)
-                            """,
-                            self.room_name,
-                            role,
-                            text,
-                            self.onboarding_session_id,
-                        )
-                    else:
-                        await self.conn.execute(
-                            """
-                            INSERT INTO chat_logs (room_name, role, content)
-                            VALUES ($1, $2, $3)
-                            """,
-                            self.room_name,
-                            role,
-                            text,
-                        )
-                    self._last_line = line_key
-                except Exception:
-                    logger.exception("chatlog_insert_failed room=%s role=%s", self.room_name, role)
+            except Exception as e:
+                logger.exception("chatlog_insert_failed room=%s role=%s error=%s", self.room_name, role, e)
 
 
 def count_remote_agents(room: rtc.Room) -> int:
