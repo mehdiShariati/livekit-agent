@@ -661,10 +661,32 @@ async def entrypoint(ctx: agents.JobContext):
                 p = participant
                 if p is None:
                     return
-                role = "assistant" if getattr(p, "is_agent", False) or getattr(p, "isAgent", False) else "user"
+                p_identity = clean_text(getattr(p, "identity", ""), "").lower()
+                p_kind = getattr(p, "kind", None)
+                is_agent_role = bool(
+                    getattr(p, "is_agent", False)
+                    or getattr(p, "isAgent", False)
+                    or p_identity.startswith("agent-")
+                    or "agent" in p_identity
+                    or (
+                        p_kind is not None
+                        and int(p_kind) == int(rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
+                    )
+                )
+                role = "assistant" if is_agent_role else "user"
                 try:
-                    for item in transcriptions or []:
-                        text = clean_text(getattr(item, "text", ""))
+                    items = transcriptions if isinstance(transcriptions, (list, tuple)) else [transcriptions]
+                    for item in items or []:
+                        # Prefer committed/final transcription chunks when available.
+                        is_final = getattr(item, "final", None)
+                        if is_final is False:
+                            continue
+                        text = clean_text(
+                            getattr(item, "text", "")
+                            or getattr(item, "transcript", "")
+                            or getattr(item, "content", ""),
+                            "",
+                        )
                         if not text:
                             continue
                         asyncio.create_task(chatlog_writer.write(role, text))
@@ -728,11 +750,47 @@ async def entrypoint(ctx: agents.JobContext):
             )
             logger.info("agent_started room=%s", room_name)
 
+            # Primary chat log source: committed speech events from AgentSession.
+            # This captures what was actually said, not generation instructions.
+            def _extract_event_text(payload: Any) -> str:
+                if payload is None:
+                    return ""
+                if isinstance(payload, str):
+                    return clean_text(payload, "")
+                for key in ("text", "transcript", "content", "message"):
+                    val = getattr(payload, key, None)
+                    if isinstance(val, str) and val.strip():
+                        return clean_text(val, "")
+                    if isinstance(payload, dict):
+                        dval = payload.get(key)
+                        if isinstance(dval, str) and dval.strip():
+                            return clean_text(dval, "")
+                return ""
+
+            def _queue_chatlog(role: str, payload: Any) -> None:
+                if chatlog_writer is None:
+                    return
+                text = _extract_event_text(payload)
+                if not text:
+                    return
+                asyncio.create_task(chatlog_writer.write(role, text))
+
+            session_on = getattr(session, "on", None)
+            if callable(session_on):
+                try:
+                    @session.on("user_speech_committed")
+                    def _on_user_speech_committed(ev):
+                        _queue_chatlog("user", ev)
+
+                    @session.on("agent_speech_committed")
+                    def _on_agent_speech_committed(ev):
+                        _queue_chatlog("assistant", ev)
+                except Exception:
+                    logger.exception("session_chatlog_event_bind_failed room=%s", room_name)
+
             runtime = ReplyOrchestrator()
             await runtime.start(session)
             await runtime.send_opening(opening_line)
-            if chatlog_writer is not None:
-                await chatlog_writer.write("assistant", opening_line)
 
             shutdown_event = asyncio.Event()
             current_shutdown_event = shutdown_event
