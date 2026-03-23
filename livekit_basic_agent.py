@@ -148,14 +148,9 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
         config.get("target_language") or config.get("learning_language"),
         "English",
     )
-    speaking_language = clean_text(
-        config.get("speaking_language"),
-        target_language or "English",
-    )
+    speaking_language = clean_text(config.get("speaking_language"), target_language or "English")
     assessment_type = clean_text(config.get("assessment_type"), "")
-    learner_level = normalize_level(
-        clean_text(config.get("learner_level") or config.get("user_level"), "A1")
-    )
+    learner_level = normalize_level(clean_text(config.get("learner_level") or config.get("user_level"), "A1"))
 
     lesson_topic = clean_text(config.get("lesson_topic"), "General speaking practice")
     lesson_goal = clean_text(config.get("lesson_goal"), "Help the learner practice effectively")
@@ -302,8 +297,8 @@ class PgRoomLock:
 
 class ChatLogWriter:
     """
-    Reliable writer for `chat_logs`.
-    Stores user STT + agent spoken text.
+    Best-effort writer for `chat_logs`.
+    Stores user STT + agent spoken text (from transcription events).
     """
 
     def __init__(self, room_name: str, onboarding_session_id: str = ""):
@@ -312,12 +307,10 @@ class ChatLogWriter:
         self.conn: Optional[asyncpg.Connection] = None
         self._lock = asyncio.Lock()
         self._last_line: Optional[tuple[str, str]] = None
-        self._pending: set[asyncio.Task] = set()
 
     async def connect(self) -> None:
         if self.conn is not None:
             return
-
         postgres_url = (
             os.getenv("POSTGRES_URL")
             or os.getenv("AGENT_POSTGRES_URL")
@@ -326,108 +319,28 @@ class ChatLogWriter:
         if not postgres_url:
             logger.warning("chatlog_postgres_url_missing room=%s", self.room_name)
             return
-
         try:
             self.conn = await asyncpg.connect(dsn=postgres_url)
         except Exception:
             logger.exception("chatlog_connect_failed room=%s", self.room_name)
             self.conn = None
 
-    def submit(self, role: str, text: str) -> None:
-        task = asyncio.create_task(self.write(role, text))
-        self._pending.add(task)
-        task.add_done_callback(self._pending.discard)
-
-    async def drain(self) -> None:
-        if self._pending:
-            await asyncio.gather(*list(self._pending), return_exceptions=True)
-
     async def close(self) -> None:
-        await self.drain()
         if self.conn is None:
             return
         with contextlib.suppress(Exception):
             await self.conn.close()
         self.conn = None
 
-    async def _insert_message_column(self, role_value: Any, text: str) -> bool:
-        params_with_session = (
-            self.room_name,
-            role_value,
-            text,
-            self.onboarding_session_id or None,
-        )
-        params_without_session = (
-            self.room_name,
-            role_value,
-            text,
-        )
-
-        try:
-            if self.onboarding_session_id:
-                await self.conn.execute(
-                    """
-                    INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
-                    VALUES ($1, $2, $3, $4)
-                    """,
-                    *params_with_session,
-                )
-            else:
-                await self.conn.execute(
-                    """
-                    INSERT INTO chat_logs (room_name, role, message)
-                    VALUES ($1, $2, $3)
-                    """,
-                    *params_without_session,
-                )
-            return True
-        except Exception:
-            return False
-
-    async def _insert_content_column(self, role_value: Any, text: str) -> bool:
-        params_with_session = (
-            self.room_name,
-            role_value,
-            text,
-            self.onboarding_session_id or None,
-        )
-        params_without_session = (
-            self.room_name,
-            role_value,
-            text,
-        )
-
-        try:
-            if self.onboarding_session_id:
-                await self.conn.execute(
-                    """
-                    INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
-                    VALUES ($1, $2, $3, $4)
-                    """,
-                    *params_with_session,
-                )
-            else:
-                await self.conn.execute(
-                    """
-                    INSERT INTO chat_logs (room_name, role, content)
-                    VALUES ($1, $2, $3)
-                    """,
-                    *params_without_session,
-                )
-            return True
-        except Exception:
-            return False
-
     async def write(self, role: str, text: str) -> None:
         role = clean_text(role, "user").lower()
         text = clean_text(text)
-
         if not text:
             return
-
         if len(text) > 4000:
             text = text[:4000]
 
+        # Skip immediate duplicates (common with partial transcript event bursts).
         line_key = (role, text)
         if self._last_line == line_key:
             return
@@ -439,32 +352,93 @@ class ChatLogWriter:
         async with self._lock:
             if self.conn is None:
                 return
-
             try:
-                role_str = role
                 role_int = 0 if role == "user" else 1
+                query_attempts: list[tuple[str, tuple[Any, ...]]] = []
+                if self.onboarding_session_id:
+                    query_attempts.extend(
+                        [
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role, text, self.onboarding_session_id),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role, text, self.onboarding_session_id),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role_int, text, self.onboarding_session_id),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content, onboarding_session_id)
+                                VALUES ($1, $2, $3, $4)
+                                """,
+                                (self.room_name, role_int, text, self.onboarding_session_id),
+                            ),
+                        ]
+                    )
+                else:
+                    query_attempts.extend(
+                        [
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role, text),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role, text),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, message)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role_int, text),
+                            ),
+                            (
+                                """
+                                INSERT INTO chat_logs (room_name, role, content)
+                                VALUES ($1, $2, $3)
+                                """,
+                                (self.room_name, role_int, text),
+                            ),
+                        ]
+                    )
 
-                inserted = await self._insert_message_column(role_str, text)
-                if not inserted:
-                    inserted = await self._insert_content_column(role_str, text)
-                if not inserted:
-                    inserted = await self._insert_message_column(role_int, text)
-                if not inserted:
-                    inserted = await self._insert_content_column(role_int, text)
+                last_error: Optional[Exception] = None
+                inserted = False
+                for sql, params in query_attempts:
+                    try:
+                        await self.conn.execute(sql, *params)
+                        inserted = True
+                        break
+                    except Exception as e:
+                        last_error = e
+                        continue
 
                 if not inserted:
-                    raise RuntimeError("all chat_logs insert attempts failed")
+                    raise last_error or RuntimeError("unknown chatlog insert error")
 
                 self._last_line = line_key
-
             except Exception as e:
-                logger.exception(
-                    "chatlog_insert_failed room=%s role=%s text=%r error=%r",
-                    self.room_name,
-                    role,
-                    text[:120],
-                    e,
-                )
+                logger.exception("chatlog_insert_failed room=%s role=%s error=%s", self.room_name, role, e)
 
 
 def count_remote_agents(room: rtc.Room) -> int:
@@ -491,6 +465,10 @@ def count_standard_participants(room: rtc.Room) -> int:
 
 
 def has_active_human_audio(room: rtc.Room) -> bool:
+    """
+    True when at least one STANDARD remote participant currently has an audio publication.
+    This is stronger than participant count and helps detect stale reconnect states.
+    """
     for participant in room.remote_participants.values():
         if not _is_standard_kind(getattr(participant, "kind", None)):
             continue
@@ -664,12 +642,12 @@ async def entrypoint(ctx: agents.JobContext):
         config = metadata.get("config") or {}
         if not isinstance(config, dict):
             config = {}
-
         onboarding_session_id = clean_text(
             config.get("onboarding_session_id") or metadata.get("onboarding_session_id"),
             "",
         )
 
+        # IMPORTANT: get room key from metadata BEFORE ctx.connect()
         room_name = clean_text(
             metadata.get("transcript_room_name"),
             clean_text(getattr(ctx.job, "room", None), "unknown-room"),
@@ -683,7 +661,6 @@ async def entrypoint(ctx: agents.JobContext):
             return
 
         system_prompt = build_system_prompt(agent_type, config)
-
         opening_line = clean_text(config.get("opening_line"), "")
         if not opening_line:
             opening_line = (
@@ -691,17 +668,13 @@ async def entrypoint(ctx: agents.JobContext):
                 f"Then continue in {clean_text(config.get('target_language') or config.get('learning_language'), 'English')}. "
                 "Keep it short and friendly."
             )
-
         voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
 
+        # Only the lock owner reaches here
         await ctx.connect()
         room_name = getattr(ctx.room, "name", room_name)
         logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
-
-        chatlog_writer = ChatLogWriter(
-            room_name=room_name,
-            onboarding_session_id=onboarding_session_id,
-        )
+        chatlog_writer = ChatLogWriter(room_name=room_name, onboarding_session_id=onboarding_session_id)
 
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
         if stale_count > 0:
@@ -712,6 +685,9 @@ async def entrypoint(ctx: agents.JobContext):
         max_restarts_after_cleanup = int(os.getenv("MAX_RESTARTS_AFTER_CLEANUP", "1"))
         restart_count = 0
 
+        # These refs are shared across the optional restart loop below.
+        # Key point: register room event handlers only once, otherwise every restart
+        # iteration would attach another listener and logs/shutdown would duplicate.
         current_shutdown_event: Optional[asyncio.Event] = None
         shutdown_reason_ref: Optional[str] = None
         saw_human_disconnect = False
@@ -719,20 +695,18 @@ async def entrypoint(ctx: agents.JobContext):
 
         room_on = getattr(ctx.room, "on", None)
         if callable(room_on):
-
             @ctx.room.on("transcription_received")
             def _transcription_received(transcriptions, participant, publication):
                 if chatlog_writer is None:
                     return
-                if participant is None:
+                p = participant
+                if p is None:
                     return
-
-                p_identity = clean_text(getattr(participant, "identity", ""), "").lower()
-                p_kind = getattr(participant, "kind", None)
-
+                p_identity = clean_text(getattr(p, "identity", ""), "").lower()
+                p_kind = getattr(p, "kind", None)
                 is_agent_role = bool(
-                    getattr(participant, "is_agent", False)
-                    or getattr(participant, "isAgent", False)
+                    getattr(p, "is_agent", False)
+                    or getattr(p, "isAgent", False)
                     or p_identity.startswith("agent-")
                     or "agent" in p_identity
                     or (
@@ -741,14 +715,13 @@ async def entrypoint(ctx: agents.JobContext):
                     )
                 )
                 role = "assistant" if is_agent_role else "user"
-
                 try:
                     items = transcriptions if isinstance(transcriptions, (list, tuple)) else [transcriptions]
                     for item in items or []:
+                        # Prefer committed/final transcription chunks when available.
                         is_final = getattr(item, "final", None)
                         if is_final is False:
                             continue
-
                         text = clean_text(
                             getattr(item, "text", "")
                             or getattr(item, "transcript", "")
@@ -757,16 +730,13 @@ async def entrypoint(ctx: agents.JobContext):
                         )
                         if not text:
                             continue
-
-                        chatlog_writer.submit(role, text)
-
+                        asyncio.create_task(chatlog_writer.write(role, text))
                 except Exception:
                     logger.exception("transcription_received_handler_failed room=%s", room_name)
 
             @ctx.room.on("participant_connected")
             def _participant_connected(participant):
                 nonlocal saw_human_disconnect, shutdown_reason_ref, current_shutdown_event
-
                 p_kind = getattr(participant, "kind", "unknown")
                 logger.info(
                     "participant_connected room=%s identity=%s kind=%s",
@@ -789,7 +759,6 @@ async def entrypoint(ctx: agents.JobContext):
             @ctx.room.on("participant_disconnected")
             def _participant_disconnected(participant):
                 nonlocal saw_human_disconnect
-
                 p_kind = getattr(participant, "kind", "unknown")
                 logger.info(
                     "participant_disconnected room=%s identity=%s kind=%s",
@@ -814,7 +783,6 @@ async def entrypoint(ctx: agents.JobContext):
                 tts=openai.TTS(voice=voice),
                 vad=get_vad(),
             )
-
             assistant = DynamicAssistant(instructions=system_prompt)
 
             await session.start(
@@ -823,39 +791,34 @@ async def entrypoint(ctx: agents.JobContext):
             )
             logger.info("agent_started room=%s", room_name)
 
+            # Primary chat log source: committed speech events from AgentSession.
+            # This captures what was actually said, not generation instructions.
             def _extract_event_text(payload: Any) -> str:
                 if payload is None:
                     return ""
-
                 if isinstance(payload, str):
                     return clean_text(payload, "")
-
                 for key in ("text", "transcript", "content", "message"):
                     val = getattr(payload, key, None)
                     if isinstance(val, str) and val.strip():
                         return clean_text(val, "")
-
                     if isinstance(payload, dict):
                         dval = payload.get(key)
                         if isinstance(dval, str) and dval.strip():
                             return clean_text(dval, "")
-
                 return ""
 
             def _queue_chatlog(role: str, payload: Any) -> None:
                 if chatlog_writer is None:
                     return
-
                 text = _extract_event_text(payload)
                 if not text:
                     return
-
-                chatlog_writer.submit(role, text)
+                asyncio.create_task(chatlog_writer.write(role, text))
 
             session_on = getattr(session, "on", None)
             if callable(session_on):
                 try:
-
                     @session.on("user_speech_committed")
                     def _on_user_speech_committed(ev):
                         _queue_chatlog("user", ev)
@@ -863,7 +826,6 @@ async def entrypoint(ctx: agents.JobContext):
                     @session.on("agent_speech_committed")
                     def _on_agent_speech_committed(ev):
                         _queue_chatlog("assistant", ev)
-
                 except Exception:
                     logger.exception("session_chatlog_event_bind_failed room=%s", room_name)
 
@@ -878,12 +840,10 @@ async def entrypoint(ctx: agents.JobContext):
 
             async def _monitor_no_human_participants():
                 nonlocal last_human_seen_at, shutdown_reason_ref
-
                 while not shutdown_event.is_set():
                     humans = count_standard_participants(ctx.room)
                     has_audio = has_active_human_audio(ctx.room)
                     now = time.monotonic()
-
                     if humans > 0 and has_audio:
                         last_human_seen_at = now
                     elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
@@ -897,12 +857,12 @@ async def entrypoint(ctx: agents.JobContext):
                         shutdown_reason_ref = "no_human_participants"
                         shutdown_event.set()
                         return
-
                     await asyncio.sleep(NO_HUMAN_POLL_SECONDS)
 
             async def _on_shutdown():
                 try:
                     logger.info("ctx shutdown callback triggered room=%s", room_name)
+                    # ctx.shutdown can happen from external reasons; always signal current iteration.
                     if current_shutdown_event is not None:
                         current_shutdown_event.set()
                 except Exception:
@@ -917,11 +877,10 @@ async def entrypoint(ctx: agents.JobContext):
                 _monitor_no_human_participants(),
                 name="no-human-participants-monitor",
             )
-
             await shutdown_event.wait()
 
+            # Cleanup this iteration.
             logger.info("agent_cleanup_start room=%s", room_name)
-
             with contextlib.suppress(Exception):
                 if runtime is not None:
                     await runtime.stop()
@@ -936,10 +895,8 @@ async def entrypoint(ctx: agents.JobContext):
                 if close_method is not None:
                     with contextlib.suppress(Exception):
                         await close_method()
-
             if chatlog_writer is not None:
                 with contextlib.suppress(Exception):
-                    await chatlog_writer.drain()
                     await chatlog_writer.close()
 
             did_iteration_cleanup = True
@@ -947,12 +904,7 @@ async def entrypoint(ctx: agents.JobContext):
 
             current_shutdown_event = None
             humans = count_standard_participants(ctx.room)
-
-            if (
-                shutdown_reason_ref is not None
-                and humans > 0
-                and restart_count < max_restarts_after_cleanup
-            ):
+            if shutdown_reason_ref is not None and humans > 0 and restart_count < max_restarts_after_cleanup:
                 restart_count += 1
                 logger.info(
                     "agent_restart_after_cleanup room=%s humans=%s reason=%s restart_count=%s",
@@ -974,7 +926,6 @@ async def entrypoint(ctx: agents.JobContext):
     finally:
         if not did_iteration_cleanup:
             logger.info("agent_cleanup_start room=%s", room_name)
-
             with contextlib.suppress(Exception):
                 if runtime is not None:
                     await runtime.stop()
@@ -989,10 +940,8 @@ async def entrypoint(ctx: agents.JobContext):
                 if close_method is not None:
                     with contextlib.suppress(Exception):
                         await close_method()
-
             if chatlog_writer is not None:
                 with contextlib.suppress(Exception):
-                    await chatlog_writer.drain()
                     await chatlog_writer.close()
 
             logger.info("agent_cleanup_done room=%s", room_name)
