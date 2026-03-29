@@ -40,15 +40,21 @@ ALLOWED_SOURCES = {"zabano", "rockonlearn"}
 VOICE_MAP = {
     "tutor": ["nova", "coral"],
     "assessment": ["coral", "verse"],
-    "onboarding": ["nova"],
+    "onboarding": ["nova", "coral"],
+    # Short first speaking check (onboarding / placement); warm, clear voices
+    "onboarding_assessment": ["coral", "verse", "nova"],
 }
 
 _VAD_INSTANCE = None
 
 
 def clean_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
     if isinstance(value, str):
         return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value).strip()
     return default
 
 
@@ -142,7 +148,137 @@ def static_safety_rules() -> str:
 """.strip()
 
 
+def _is_onboarding_speaking_session(agent_type: str, config: dict[str, Any]) -> bool:
+    """
+    Short first speaking check in app onboarding (pre-login) or placement-style rooms.
+    Must stay aligned with backend assessment_type onboarding/placement.
+    """
+    at = clean_text(agent_type, "").lower()
+    assess = clean_text(config.get("assessment_type"), "").lower()
+    if assess in ("onboarding", "placement"):
+        return True
+    if at == "onboarding" and assess == "":
+        return True
+    return False
+
+
+def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
+    native = clean_text(config.get("native_language"), "the learner's native language")
+    target = clean_text(
+        config.get("speaking_language")
+        or config.get("target_language")
+        or config.get("learning_language"),
+        "English",
+    )
+    level = normalize_level(clean_text(config.get("learner_level") or config.get("user_level"), "A1"))
+    goal = clean_text(config.get("selected_goal"), "")
+    focus = clean_text(config.get("goal_focus"), "")
+    profile = clean_text(config.get("progress_summary"), "")[:2500]
+    name = clean_text(config.get("user_name") or config.get("display_name"), "")
+
+    lines = [
+        "## Learner context (internal — do not read as a bullet list to the user)",
+        f"- Native language (brief support only): {native}",
+        f"- Language they should practice speaking: {target}",
+        f"- Self-reported level hint: {level} (adapt complexity; do not quiz them on labels)",
+    ]
+    if name:
+        lines.append(f"- Name (use naturally if it fits): {name}")
+    if goal:
+        lines.append(f"- Stated motivation / goal: {goal}")
+    if focus:
+        lines.append(f"- Goal focus: {focus}")
+    if profile:
+        lines.append(f"- Profile notes: {profile}")
+    return "\n".join(lines)
+
+
+def build_onboarding_speaking_system_prompt(config: dict[str, Any]) -> str:
+    native = clean_text(config.get("native_language"), "the learner's native language")
+    target = clean_text(
+        config.get("speaking_language")
+        or config.get("target_language")
+        or config.get("learning_language"),
+        "English",
+    )
+    dynamic = _onboarding_dynamic_context(config)
+
+    core = f"""
+You are RockOn's voice coach for a **very short first speaking check** (about one minute of dialogue).
+
+Tone: warm, confident, human — like a great language coach, not customer support and not an exam.
+
+Session rules:
+- Target **60–90 seconds** total back-and-forth. Be concise every turn.
+- Ask **at most 2 questions** in the whole session. Question 1 is required: ask (in natural {target}) why they are learning {target}.
+- Optional question 2: only if their answer was too short or unclear — one short follow-up (e.g. what they want to use the language for).
+- After they answer in a meaningful way, **stop asking questions**.
+- Then give closing feedback in this order:
+  1) One specific positive (clarity, confidence, or vocabulary).
+  2) **Exactly one** small correction — say the better phrase simply, no lecture.
+  3) A rough level estimate in plain words (e.g. around A2, or between A2 and B1).
+  4) One short motivating line about improving with regular practice on RockOn.
+  5) A clear sign-off so they know the check is done (e.g. that's your quick check — nice work).
+- Do **not** say: "How can I help you?", "Welcome to the platform", "Ready to test your English?", or similar.
+- Do **not** list many corrections, give long paragraphs, or mention internal scores or rubrics.
+- Encourage speech in {target}; use {native} only briefly for comfort if needed.
+- If they mix languages, understand and gently steer back to {target}.
+
+Opening: follow the separate first-turn instruction you receive — it defines exactly how to start.
+""".strip()
+
+    return f"{core}\n\n{dynamic}"
+
+
+def default_onboarding_speaking_opening(config: dict[str, Any]) -> str:
+    """First-turn spoken instruction when backend did not send opening_line."""
+    native = clean_text(config.get("native_language"), "")
+    target = clean_text(
+        config.get("speaking_language")
+        or config.get("target_language")
+        or config.get("learning_language"),
+        "English",
+    )
+    native_clause = (
+        f"You may use one short sentence in {native} for warmth, then switch entirely to {target}. "
+        if native
+        else f"Greet briefly in {target}. "
+    )
+    return (
+        "FIRST ASSISTANT TURN: "
+        + native_clause
+        + f"Say this is a quick speaking check (~one minute), not a test. "
+        f"Then ask one clear open question in {target}: why are they learning {target}? "
+        "Keep under ~25 seconds of speech, then listen."
+    )
+
+
+def resolve_opening_line(agent_type: str, config: dict[str, Any]) -> str:
+    raw = clean_text(config.get("opening_line"), "")
+    if raw:
+        return raw
+    if _is_onboarding_speaking_session(agent_type, config):
+        return default_onboarding_speaking_opening(config)
+    native = clean_text(config.get("native_language"), "English")
+    target = clean_text(config.get("target_language") or config.get("learning_language"), "English")
+    return (
+        f"First assistant message only: greet warmly in {native}. "
+        f"Then continue in {target}. Keep it short and friendly."
+    )
+
+
+def pick_voice(agent_type: str, config: dict[str, Any]) -> str:
+    if _is_onboarding_speaking_session(agent_type, config):
+        voices = VOICE_MAP.get("onboarding_assessment") or VOICE_MAP["assessment"]
+    else:
+        voices = VOICE_MAP.get(agent_type) or VOICE_MAP[DEFAULT_AGENT_TYPE]
+    return random.choice(voices)
+
+
 def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
+    if _is_onboarding_speaking_session(agent_type, config):
+        return build_onboarding_speaking_system_prompt(config)
+
     native_language = clean_text(config.get("native_language"), "English")
     target_language = clean_text(
         config.get("target_language") or config.get("learning_language"),
@@ -661,20 +797,27 @@ async def entrypoint(ctx: agents.JobContext):
             ctx.shutdown("duplicate_agent_pg_lock")
             return
 
-        system_prompt = build_system_prompt(agent_type, config)
-        opening_line = clean_text(config.get("opening_line"), "")
-        if not opening_line:
-            opening_line = (
-                f"First assistant message only: greet warmly in {clean_text(config.get('native_language'), 'English')}. "
-                f"Then continue in {clean_text(config.get('target_language') or config.get('learning_language'), 'English')}. "
-                "Keep it short and friendly."
+        if isinstance(config.get("behavior"), dict):
+            logger.warning(
+                "config.behavior is a dict and is not spoken; use opening_line (string) only room=%s",
+                room_name,
             )
-        voice = random.choice(VOICE_MAP.get(agent_type, VOICE_MAP[DEFAULT_AGENT_TYPE]))
+
+        system_prompt = build_system_prompt(agent_type, config)
+        opening_line = resolve_opening_line(agent_type, config)
+        voice = pick_voice(agent_type, config)
+        short_onboarding = _is_onboarding_speaking_session(agent_type, config)
 
         # Only the lock owner reaches here
         await ctx.connect()
         room_name = getattr(ctx.room, "name", room_name)
-        logger.info("agent_entry room=%s agent_type=%s voice=%s", room_name, agent_type, voice)
+        logger.info(
+            "agent_entry room=%s agent_type=%s voice=%s onboarding_speaking=%s",
+            room_name,
+            agent_type,
+            voice,
+            short_onboarding,
+        )
         chatlog_writer = ChatLogWriter(room_name=room_name, onboarding_session_id=onboarding_session_id)
 
         stale_count = await wait_for_stale_agents_to_leave(ctx.room)
@@ -1108,5 +1251,5 @@ async def entrypoint(ctx: agents.JobContext):
                 await room_lock.release()
 
 
-# if __name__ == "__main__":
-#     agents.cli.run_app(entrypoint)
+if __name__ == "__main__":
+    agents.cli.run_app(entrypoint)
