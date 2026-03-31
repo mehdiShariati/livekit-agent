@@ -955,23 +955,7 @@ async def entrypoint(ctx: agents.JobContext):
         # Only the lock owner reaches here
         await ctx.connect()
         room_name = getattr(ctx.room, "name", room_name)
-        # Always check current room logs and inject user/assistant history into prompt context.
-        history_instruction = await fetch_room_history_instruction(
-            room_name,
-            onboarding_session_id=onboarding_session_id,
-        )
-        if history_instruction:
-            current_resume = clean_text(config.get("resume_instruction"), "")
-            config["resume_instruction"] = (
-                f"{current_resume}\n\n{history_instruction}".strip()
-                if current_resume
-                else history_instruction
-            )
-            config["conversation_history_text"] = history_instruction
-        else:
-            config["conversation_history_text"] = ""
-
-        # Build prompts after history is attached, so resumed rooms keep memory.
+        # Build prompts from backend-provided config (resume API should populate conversation history).
         system_prompt = build_system_prompt(agent_type, config)
         opening_line = resolve_opening_line(agent_type, config)
         voice = pick_voice(agent_type, config)
