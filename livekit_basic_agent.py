@@ -374,6 +374,95 @@ def stable_lock_key(room_name: str) -> int:
     return int.from_bytes(digest[:8], "big", signed=False) % (2**63 - 1)
 
 
+def _normalize_history_role(value: Any) -> str:
+    txt = clean_text(value, "").lower()
+    if txt in {"assistant", "agent", "ai", "bot", "system", "tutor"}:
+        return "assistant"
+    if txt in {"user", "human", "learner", "student"}:
+        return "user"
+    # Some schemas store int role codes.
+    try:
+        n = int(value)
+        return "assistant" if n == 1 else "user"
+    except Exception:
+        return "user"
+
+
+def _build_history_instruction(rows: list[asyncpg.Record], *, max_chars: int = 3200) -> str:
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for r in rows:
+        role = _normalize_history_role(r.get("role"))
+        content = clean_text(r.get("content"), "")
+        if not content:
+            continue
+        lines.append(f"{'User' if role == 'user' else 'Assistant'}: {content}")
+    if not lines:
+        return ""
+    text = "Previous conversation history (use as context, do not read verbatim):\n" + "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
+async def fetch_room_history_instruction(
+    room_name: str,
+    *,
+    onboarding_session_id: str = "",
+    max_rows: int = 80,
+) -> str:
+    postgres_url = (
+        os.getenv("POSTGRES_URL")
+        or os.getenv("AGENT_POSTGRES_URL")
+        or os.getenv("DATABASE_URL")
+    )
+    if not postgres_url or not room_name:
+        return ""
+    conn: Optional[asyncpg.Connection] = None
+    try:
+        conn = await asyncpg.connect(dsn=postgres_url)
+        oid = clean_text(onboarding_session_id, "")
+        rows: list[asyncpg.Record]
+        if oid:
+            rows = await conn.fetch(
+                """
+                SELECT role, COALESCE(message, content, '') AS content
+                FROM chat_logs
+                WHERE room_name = $1 OR onboarding_session_id = $2
+                ORDER BY created_at DESC
+                LIMIT $3
+                """,
+                room_name,
+                oid,
+                max_rows,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT role, COALESCE(message, content, '') AS content
+                FROM chat_logs
+                WHERE room_name = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                room_name,
+                max_rows,
+            )
+        if not rows:
+            return ""
+        # fetch is DESC for speed; restore chronological order for instruction readability.
+        rows = list(reversed(rows))
+        return _build_history_instruction(rows)
+    except Exception:
+        logger.exception("history_fetch_failed room=%s", room_name)
+        return ""
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                await conn.close()
+
+
 class PgRoomLock:
     """
     Dedicated connection + advisory lock.
@@ -789,6 +878,21 @@ async def entrypoint(ctx: agents.JobContext):
             metadata.get("transcript_room_name"),
             clean_text(getattr(ctx.job, "room", None), "unknown-room"),
         )
+
+        # Pull prior room logs and inject as explicit instruction context.
+        history_instruction = await fetch_room_history_instruction(
+            room_name,
+            onboarding_session_id=onboarding_session_id,
+        )
+        if history_instruction:
+            current_resume = clean_text(config.get("resume_instruction"), "")
+            config["resume_instruction"] = (
+                f"{current_resume}\n\n{history_instruction}".strip()
+                if current_resume
+                else history_instruction
+            )
+            # Also keep a dedicated field for future template usage.
+            config["conversation_history_text"] = history_instruction
 
         room_lock = PgRoomLock(room_name)
         locked = await room_lock.acquire()
