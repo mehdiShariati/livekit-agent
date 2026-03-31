@@ -202,6 +202,7 @@ def build_onboarding_speaking_system_prompt(config: dict[str, Any]) -> str:
         "English",
     )
     dynamic = _onboarding_dynamic_context(config)
+    history = clean_text(config.get("conversation_history_text"), "")
 
     core = f"""
 You are a warm, expert voice coach for a **very short first speaking check** (about one minute of dialogue).
@@ -227,7 +228,12 @@ Session rules:
 Opening: follow the separate first-turn instruction you receive — it defines exactly how to start.
 """.strip()
 
-    return f"{core}\n\n{dynamic}"
+    history_block = (
+        f"\n\nPrevious conversation history (context only; do not read verbatim):\n{history}"
+        if history
+        else ""
+    )
+    return f"{core}\n\n{dynamic}{history_block}"
 
 
 def default_onboarding_speaking_opening(config: dict[str, Any]) -> str:
@@ -301,6 +307,7 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
         config.get("resume_instruction"),
         "If there was a previous session, continue naturally. Otherwise start simply.",
     )
+    history_text = clean_text(config.get("conversation_history_text"), "")
 
     return f"""
 {static_agent_role(agent_type)}
@@ -344,6 +351,9 @@ Previous session summary:
 
 Resume behavior:
 {resume_instruction}
+
+Conversation history context:
+{history_text or "No prior room history provided."}
 
 Safety and operating rules:
 {static_safety_rules()}
@@ -423,32 +433,82 @@ async def fetch_room_history_instruction(
     try:
         conn = await asyncpg.connect(dsn=postgres_url)
         oid = clean_text(onboarding_session_id, "")
-        rows: list[asyncpg.Record]
+        rows: list[asyncpg.Record] = []
+        queries: list[tuple[str, tuple[Any, ...]]] = []
         if oid:
-            rows = await conn.fetch(
-                """
-                SELECT role, COALESCE(message, content, '') AS content
-                FROM chat_logs
-                WHERE room_name = $1 OR onboarding_session_id = $2
-                ORDER BY created_at DESC
-                LIMIT $3
-                """,
-                room_name,
-                oid,
-                max_rows,
+            queries.extend(
+                [
+                    (
+                        """
+                        SELECT role, COALESCE(message, content, '') AS content
+                        FROM chat_logs
+                        WHERE room_name = $1 OR onboarding_session_id = $2
+                        ORDER BY created_at DESC
+                        LIMIT $3
+                        """,
+                        (room_name, oid, max_rows),
+                    ),
+                    (
+                        """
+                        SELECT role, COALESCE(message, content, '') AS content
+                        FROM chat_logs
+                        WHERE room_name = $1 OR onboarding_session_id = $2
+                        ORDER BY id DESC
+                        LIMIT $3
+                        """,
+                        (room_name, oid, max_rows),
+                    ),
+                    (
+                        """
+                        SELECT role, COALESCE(message, content, '') AS content
+                        FROM chat_logs
+                        WHERE room_name = $1 OR onboarding_session_id = $2
+                        LIMIT $3
+                        """,
+                        (room_name, oid, max_rows),
+                    ),
+                ]
             )
         else:
-            rows = await conn.fetch(
-                """
-                SELECT role, COALESCE(message, content, '') AS content
-                FROM chat_logs
-                WHERE room_name = $1
-                ORDER BY created_at DESC
-                LIMIT $2
-                """,
-                room_name,
-                max_rows,
+            queries.extend(
+                [
+                    (
+                        """
+                        SELECT role, COALESCE(message, content, '') AS content
+                        FROM chat_logs
+                        WHERE room_name = $1
+                        ORDER BY created_at DESC
+                        LIMIT $2
+                        """,
+                        (room_name, max_rows),
+                    ),
+                    (
+                        """
+                        SELECT role, COALESCE(message, content, '') AS content
+                        FROM chat_logs
+                        WHERE room_name = $1
+                        ORDER BY id DESC
+                        LIMIT $2
+                        """,
+                        (room_name, max_rows),
+                    ),
+                    (
+                        """
+                        SELECT role, COALESCE(message, content, '') AS content
+                        FROM chat_logs
+                        WHERE room_name = $1
+                        LIMIT $2
+                        """,
+                        (room_name, max_rows),
+                    ),
+                ]
             )
+        for sql, params in queries:
+            try:
+                rows = await conn.fetch(sql, *params)
+                break
+            except Exception:
+                continue
         if not rows:
             return ""
         # fetch is DESC for speed; restore chronological order for instruction readability.
@@ -879,21 +939,6 @@ async def entrypoint(ctx: agents.JobContext):
             clean_text(getattr(ctx.job, "room", None), "unknown-room"),
         )
 
-        # Pull prior room logs and inject as explicit instruction context.
-        history_instruction = await fetch_room_history_instruction(
-            room_name,
-            onboarding_session_id=onboarding_session_id,
-        )
-        if history_instruction:
-            current_resume = clean_text(config.get("resume_instruction"), "")
-            config["resume_instruction"] = (
-                f"{current_resume}\n\n{history_instruction}".strip()
-                if current_resume
-                else history_instruction
-            )
-            # Also keep a dedicated field for future template usage.
-            config["conversation_history_text"] = history_instruction
-
         room_lock = PgRoomLock(room_name)
         locked = await room_lock.acquire()
         if not locked:
@@ -907,14 +952,30 @@ async def entrypoint(ctx: agents.JobContext):
                 room_name,
             )
 
+        # Only the lock owner reaches here
+        await ctx.connect()
+        room_name = getattr(ctx.room, "name", room_name)
+        # Always check current room logs and inject user/assistant history into prompt context.
+        history_instruction = await fetch_room_history_instruction(
+            room_name,
+            onboarding_session_id=onboarding_session_id,
+        )
+        if history_instruction:
+            current_resume = clean_text(config.get("resume_instruction"), "")
+            config["resume_instruction"] = (
+                f"{current_resume}\n\n{history_instruction}".strip()
+                if current_resume
+                else history_instruction
+            )
+            config["conversation_history_text"] = history_instruction
+        else:
+            config["conversation_history_text"] = ""
+
+        # Build prompts after history is attached, so resumed rooms keep memory.
         system_prompt = build_system_prompt(agent_type, config)
         opening_line = resolve_opening_line(agent_type, config)
         voice = pick_voice(agent_type, config)
         short_onboarding = _is_onboarding_speaking_session(agent_type, config)
-
-        # Only the lock owner reaches here
-        await ctx.connect()
-        room_name = getattr(ctx.room, "name", room_name)
         logger.info(
             "agent_entry room=%s agent_type=%s voice=%s onboarding_speaking=%s",
             room_name,
