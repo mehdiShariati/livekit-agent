@@ -31,10 +31,11 @@ Fields (all required unless noted):
 - pass: boolean — true if understandable and reasonably correct for level
 - feedback: ONE short encouraging sentence in the learner's native language
 - grammar_note: optional ONE short tip in native language, or empty string
+- corrected_text: when pass is false OR there is a fixable mistake, the full corrected sentence in the speaking/target language; otherwise empty string
 - reason: short snake_case tag e.g. good_pronunciation, good_fluency, needs_clarity, grammar_fix
-- emoji: single emoji character for praise (or neutral 👍 if weak)
-- emojis: optional array of 1-3 emojis when praise is strong; omit or [] if not needed
-- intensity: integer 1 (subtle), 2 (good), or 3 (exceptional)
+- emojis: REQUIRED array of 4-6 DIFFERENT emoji characters tied to what the learner talked about — pick concrete nouns, places, activities, feelings, or objects from THEIR sentence (examples: pizza → ["🍕","🧀","🇮🇹","😋","🍝"]; new job → ["💼","🎉","👔","📊","✨"]; family → ["👨‍👩‍👧","❤️","🏠","🤗"]). Do NOT return only generic praise like 👍👏✨ unless the utterance has no clear topic.
+- emoji: same as emojis[0] (primary emoji)
+- intensity: integer 1 (subtle), 2 (good), or 3 (exceptional — use more vivid topical emojis)
 
 Be warm and brief. Do not repeat the full user sentence in feedback."""
 
@@ -101,8 +102,8 @@ def _normalize_emojis(parsed: dict[str, Any]) -> list[str]:
     if isinstance(single, str) and single.strip() and single.strip() not in out:
         out.insert(0, single.strip())
     if not out:
-        out = ["👍"]
-    return out[:3]
+        out = ["👍", "✨"]
+    return out[:8]
 
 
 async def publish_client_event(room: rtc.Room, payload: dict[str, Any]) -> None:
@@ -184,6 +185,7 @@ async def evaluate_and_publish(
     passed = bool(parsed.get("pass"))
     feedback = str(parsed.get("feedback") or "").strip()[:500]
     grammar_note = str(parsed.get("grammar_note") or "").strip()[:300]
+    corrected_text = str(parsed.get("corrected_text") or "").strip()[:2000]
     reason = str(parsed.get("reason") or "turn_eval").strip()[:64]
     emojis = _normalize_emojis(parsed)
     intensity = _clamp_int(parsed.get("intensity"), 1, 3, 2 if passed else 1)
@@ -196,29 +198,30 @@ async def evaluate_and_publish(
         "pass": passed,
         "feedback": feedback,
         "grammar_note": grammar_note,
+        "corrected_text": corrected_text,
         "reason": reason,
     }
 
     emoji_payload: dict[str, Any] = {
         "type": EVENT_EMOJI_REWARD,
         "turn_id": turn_id,
-        "intensity": intensity,
+        "user_text": user_text[:500],
+        "intensity": intensity if passed else max(1, min(intensity, 2)),
         "reason": reason,
+        "emojis": emojis,
+        "emoji": emojis[0] if emojis else "👍",
     }
-    if len(emojis) == 1:
-        emoji_payload["emoji"] = emojis[0]
-    else:
-        emoji_payload["emojis"] = emojis
-        emoji_payload["emoji"] = emojis[0]
-
     try:
         await publish_client_event(room, eval_payload)
-        await publish_client_event(room, emoji_payload)
+        if passed:
+            await publish_client_event(room, emoji_payload)
         logger.info(
-            "realtime_feedback_published turn_id=%s score=%s intensity=%s",
+            "realtime_feedback_published turn_id=%s score=%s pass=%s emojis=%s intensity=%s",
             turn_id,
             score,
-            intensity,
+            passed,
+            emojis,
+            intensity if passed else 0,
         )
     except Exception:
         logger.exception("realtime_feedback_publish_failed turn_id=%s", turn_id)
