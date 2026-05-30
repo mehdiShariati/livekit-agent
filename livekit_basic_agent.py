@@ -9,8 +9,6 @@ import time
 import uuid
 from typing import Any, Optional
 
-from realtime_speaking_feedback import evaluate_and_publish
-
 import asyncpg
 from dotenv import load_dotenv
 from livekit import agents, rtc
@@ -18,6 +16,8 @@ from livekit.agents import Agent, AgentSession
 from livekit.plugins import openai, silero
 
 load_dotenv(".env")
+
+from realtime_speaking_feedback import evaluate_and_publish
 
 logger = logging.getLogger("zabano.agent")
 logging.basicConfig(
@@ -964,12 +964,14 @@ async def entrypoint(ctx: agents.JobContext):
         opening_line = resolve_opening_line(agent_type, config)
         voice = pick_voice(agent_type, config)
         short_onboarding = _is_onboarding_speaking_session(agent_type, config)
+        realtime_feedback_flag = config.get("realtime_speaking_feedback", True) is not False
         logger.info(
-            "agent_entry room=%s agent_type=%s voice=%s onboarding_speaking=%s",
+            "agent_entry room=%s agent_type=%s voice=%s onboarding_speaking=%s realtime_feedback=%s",
             room_name,
             agent_type,
             voice,
             short_onboarding,
+            realtime_feedback_flag,
         )
         chatlog_writer = ChatLogWriter(room_name=room_name, onboarding_session_id=onboarding_session_id)
 
@@ -1113,7 +1115,7 @@ async def entrypoint(ctx: agents.JobContext):
                     return
                 asyncio.create_task(chatlog_writer.write(role, text))
 
-            realtime_feedback_enabled = config.get("realtime_speaking_feedback", True) is not False
+            realtime_feedback_enabled = realtime_feedback_flag
             last_feedback_text = ""
             last_feedback_at = 0.0
 
@@ -1133,6 +1135,12 @@ async def entrypoint(ctx: agents.JobContext):
                 last_feedback_text = cleaned
                 last_feedback_at = now
                 turn_id = str(uuid.uuid4())
+                logger.info(
+                    "realtime_feedback_scheduled room=%s turn_id=%s words=%s",
+                    room_name,
+                    turn_id,
+                    len(cleaned.split()),
+                )
                 asyncio.create_task(
                     evaluate_and_publish(
                         ctx.room,
@@ -1140,7 +1148,8 @@ async def entrypoint(ctx: agents.JobContext):
                         config=config,
                         turn_id=turn_id,
                         max_concurrent=MAX_CONCURRENT_LLM_CALLS,
-                    )
+                    ),
+                    name=f"realtime-feedback-{turn_id[:8]}",
                 )
 
             # Fallback source: poll session chat context and persist unseen lines.
