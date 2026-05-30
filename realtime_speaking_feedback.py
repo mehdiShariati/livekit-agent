@@ -33,9 +33,13 @@ Fields (all required unless noted):
 - grammar_note: optional ONE short tip in native language, or empty string
 - corrected_text: when pass is false OR there is a fixable mistake, the full corrected sentence in the speaking/target language; otherwise empty string
 - reason: short snake_case tag e.g. good_pronunciation, good_fluency, needs_clarity, grammar_fix
-- emojis: REQUIRED array of 4-6 DIFFERENT emoji characters tied to what the learner talked about — pick concrete nouns, places, activities, feelings, or objects from THEIR sentence (examples: pizza → ["🍕","🧀","🇮🇹","😋","🍝"]; new job → ["💼","🎉","👔","📊","✨"]; family → ["👨‍👩‍👧","❤️","🏠","🤗"]). Do NOT return only generic praise like 👍👏✨ unless the utterance has no clear topic.
-- emoji: same as emojis[0] (primary emoji)
-- intensity: integer 1 (subtle), 2 (good), or 3 (exceptional — use more vivid topical emojis)
+- emojis: REQUIRED array of exactly 3-4 emoji characters that PRECISELY match what the learner talked about. Rules:
+  * Country, city, or nationality → use that place's flag plus one related icon (Turkey/Türkiye/Turkish → 🇹🇷; France/French/Paris → 🇫🇷; Japan/Japanese/Tokyo → 🇯🇵; USA/America/American → 🇺🇸; Germany/German/Berlin → 🇩🇪; Italy/Italian/Rome → 🇮🇹; Spain/Spanish/Madrid → 🇪🇸; UK/Britain/England/London → 🇬🇧)
+  * Video games / gaming / consoles → 🎮 🕹️ 👾 (not generic praise)
+  * A specific food, sport, job, hobby, or object → emojis for THAT thing only
+  * Do NOT mix unrelated topics. Do NOT use only 👍 👏 ✨ unless the sentence has no specific topic at all.
+- emoji: same as emojis[0] (primary emoji — must match the main topic)
+- intensity: integer 1 (subtle, 3 emojis), 2 (good), or 3 (exceptional answer — still max 4 topical emojis)
 
 Be warm and brief. Do not repeat the full user sentence in feedback."""
 
@@ -102,8 +106,8 @@ def _normalize_emojis(parsed: dict[str, Any]) -> list[str]:
     if isinstance(single, str) and single.strip() and single.strip() not in out:
         out.insert(0, single.strip())
     if not out:
-        out = ["👍", "✨"]
-    return out[:8]
+        out = ["👍"]
+    return out[:5]
 
 
 async def publish_client_event(room: rtc.Room, payload: dict[str, Any]) -> None:
