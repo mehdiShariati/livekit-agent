@@ -6,7 +6,10 @@ import logging
 import os
 import random
 import time
+import uuid
 from typing import Any, Optional
+
+from realtime_speaking_feedback import evaluate_and_publish
 
 import asyncpg
 from dotenv import load_dotenv
@@ -32,6 +35,7 @@ REPLY_TIMEOUT_SECONDS = float(os.getenv("REPLY_TIMEOUT_SECONDS", "20"))
 STALE_AGENT_WAIT_SECONDS = float(os.getenv("STALE_AGENT_WAIT_SECONDS", "3.5"))
 STALE_AGENT_POLL_SECONDS = float(os.getenv("STALE_AGENT_POLL_SECONDS", "0.35"))
 MAX_CONCURRENT_LLM_CALLS = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "1"))
+REALTIME_FEEDBACK_DEDUP_SECONDS = float(os.getenv("REALTIME_FEEDBACK_DEDUP_SECONDS", "2.0"))
 NO_HUMAN_GRACE_SECONDS = float(os.getenv("NO_HUMAN_GRACE_SECONDS", "15"))
 NO_HUMAN_POLL_SECONDS = float(os.getenv("NO_HUMAN_POLL_SECONDS", "0.5"))
 
@@ -1109,6 +1113,36 @@ async def entrypoint(ctx: agents.JobContext):
                     return
                 asyncio.create_task(chatlog_writer.write(role, text))
 
+            realtime_feedback_enabled = config.get("realtime_speaking_feedback", True) is not False
+            last_feedback_text = ""
+            last_feedback_at = 0.0
+
+            def _schedule_user_turn_feedback(text: str) -> None:
+                nonlocal last_feedback_text, last_feedback_at
+                if not realtime_feedback_enabled:
+                    return
+                cleaned = clean_text(text, "")
+                if not cleaned:
+                    return
+                now = time.monotonic()
+                if (
+                    cleaned == last_feedback_text
+                    and (now - last_feedback_at) < REALTIME_FEEDBACK_DEDUP_SECONDS
+                ):
+                    return
+                last_feedback_text = cleaned
+                last_feedback_at = now
+                turn_id = str(uuid.uuid4())
+                asyncio.create_task(
+                    evaluate_and_publish(
+                        ctx.room,
+                        user_text=cleaned,
+                        config=config,
+                        turn_id=turn_id,
+                        max_concurrent=MAX_CONCURRENT_LLM_CALLS,
+                    )
+                )
+
             # Fallback source: poll session chat context and persist unseen lines.
             # This avoids hard dependency on specific transcription event names.
             seen_chatlog_lines: set[tuple[str, str]] = set()
@@ -1241,12 +1275,18 @@ async def entrypoint(ctx: agents.JobContext):
                         if not text:
                             return
                         logger.info("chatlog_event session=conversation_item_added room=%s role=%s", room_name, role)
-                        asyncio.create_task(chatlog_writer.write(role, text))
+                        if chatlog_writer is not None:
+                            asyncio.create_task(chatlog_writer.write(role, text))
+                        if role == "user":
+                            _schedule_user_turn_feedback(text)
 
                     @session.on("user_speech_committed")
                     def _on_user_speech_committed(ev):
                         logger.info("chatlog_event session=user_speech_committed room=%s", room_name)
+                        text = _extract_event_text(ev)
                         _queue_chatlog("user", ev)
+                        if text:
+                            _schedule_user_turn_feedback(text)
 
                     @session.on("agent_speech_committed")
                     def _on_agent_speech_committed(ev):
@@ -1257,7 +1297,10 @@ async def entrypoint(ctx: agents.JobContext):
                     @session.on("input_speech_committed")
                     def _on_input_speech_committed(ev):
                         logger.info("chatlog_event session=input_speech_committed room=%s", room_name)
+                        text = _extract_event_text(ev)
                         _queue_chatlog("user", ev)
+                        if text:
+                            _schedule_user_turn_feedback(text)
 
                     @session.on("output_speech_committed")
                     def _on_output_speech_committed(ev):
