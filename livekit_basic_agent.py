@@ -62,15 +62,22 @@ def clean_text(value: Any, default: str = "") -> str:
     return default
 
 
-def normalize_level(level: str) -> str:
-    level = clean_text(level, "A1").upper()
-    if level in {"A1", "A2", "B1", "B2", "C1", "C2"}:
-        return level
-    return "A1"
+def normalize_level(level: str, *, default: str = "A1") -> str:
+    level = clean_text(level, "").upper()
+    if level in {"A1", "A2", "B1", "B2", "C1", "C2", "ADAPTIVE"}:
+        return level or default
+    return default
 
 
 def language_policy(native_language: str, target_language: str, learner_level: str) -> str:
     learner_level = normalize_level(learner_level)
+
+    if learner_level == "ADAPTIVE":
+        return (
+            f"Speak mostly in {target_language}. Match the learner's complexity from their last answer: "
+            f"short simple phrases if they struggle; longer natural {target_language} if they speak in full sentences. "
+            f"Use {native_language} only briefly when they are stuck."
+        )
 
     rules = {
         "A1": (
@@ -174,7 +181,10 @@ def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
         or config.get("learning_language"),
         "English",
     )
-    level = normalize_level(clean_text(config.get("learner_level") or config.get("user_level"), "A1"))
+    level = normalize_level(
+        clean_text(config.get("learner_level") or config.get("user_level"), ""),
+        default="ADAPTIVE",
+    )
     goal = clean_text(config.get("selected_goal"), "")
     focus = clean_text(config.get("goal_focus"), "")
     profile = clean_text(config.get("progress_summary"), "")[:2500]
@@ -184,7 +194,7 @@ def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
         "## Learner context (internal — do not read as a bullet list to the user)",
         f"- Native language (brief support only): {native}",
         f"- Language they should practice speaking: {target}",
-        f"- Self-reported level hint: {level} (adapt complexity; do not quiz them on labels)",
+        f"- Level hint: {level} (internal — infer from their speech; never repeat a CEFR label except once at closing)",
     ]
     if name:
         lines.append(f"- Name (use naturally if it fits): {name}")
@@ -221,11 +231,13 @@ Session rules:
 - Then give closing feedback in this order:
   1) One specific positive (clarity, confidence, or vocabulary).
   2) **Exactly one** small correction — say the better phrase simply, no lecture.
-  3) A rough level estimate in plain words (e.g. around A2, or between A2 and B1).
+  3) **Once only** — a rough level estimate in plain words from what they actually said (e.g. around A2, between A2 and B1). Do NOT default to A1 unless they only used isolated words.
   4) One short motivating line about steady practice — conversational, not a sales pitch and no app name.
   5) A clear sign-off so they know the check is done (e.g. that's your quick check — nice work).
 - Do **not** say: "How can I help you?", "Welcome to the platform", "Ready to test your English?", or similar.
+- Do **not** repeat "you are A1" (or any CEFR label) during the conversation — only at closing if earned by their speech.
 - Do **not** list many corrections, give long paragraphs, or mention internal scores or rubrics.
+- After each learner answer, react to **their content** (topic, vocabulary, clarity) before the next prompt.
 - Encourage speech in {target}; use {native} only briefly for comfort if needed.
 - If they mix languages, understand and gently steer back to {target}.
 
@@ -296,7 +308,12 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
     )
     speaking_language = clean_text(config.get("speaking_language"), target_language or "English")
     assessment_type = clean_text(config.get("assessment_type"), "")
-    learner_level = normalize_level(clean_text(config.get("learner_level") or config.get("user_level"), "A1"))
+    raw_level = clean_text(config.get("learner_level") or config.get("user_level"), "")
+    is_onboarding = _is_onboarding_speaking_session(agent_type, config)
+    learner_level = normalize_level(
+        raw_level,
+        default="ADAPTIVE" if is_onboarding else "A1",
+    )
 
     lesson_topic = clean_text(config.get("lesson_topic"), "General speaking practice")
     lesson_goal = clean_text(config.get("lesson_goal"), "Help the learner practice effectively")

@@ -26,9 +26,11 @@ MIN_WORDS_FOR_EVAL = int(os.getenv("REALTIME_FEEDBACK_MIN_WORDS", "3"))
 REALTIME_TURN_EVAL_SYSTEM = """You evaluate ONE learner utterance in a live speaking session.
 Output ONE JSON object only (no markdown).
 
+Judge the utterance on its own merits (length, clarity, grammar, vocabulary) — do not assume beginner unless the sentence is truly minimal.
+
 Fields (all required unless noted):
 - score: integer 0-100 for this utterance only
-- pass: boolean — true if understandable and reasonably correct for level
+- pass: boolean — true if understandable and reasonably correct for what they attempted
 - feedback: ONE short encouraging sentence in the learner's native language
 - grammar_note: optional ONE short tip in native language, or empty string
 - corrected_text: when pass is false OR there is a fixable mistake, the full corrected sentence in the speaking/target language; otherwise empty string
@@ -136,7 +138,7 @@ async def _call_eval_llm(
         or config.get("target_language")
         or "English"
     )[:64]
-    level = str(config.get("learner_level") or config.get("user_level") or "B1")[:12]
+    level = str(config.get("learner_level") or config.get("user_level") or "ADAPTIVE")[:12]
 
     user_prompt = (
         f"Native language for feedback: {native}\n"
