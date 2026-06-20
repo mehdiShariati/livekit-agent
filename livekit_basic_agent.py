@@ -1131,7 +1131,7 @@ async def entrypoint(ctx: agents.JobContext):
                     segment_id or "none",
                     text[:180],
                 )
-                sess.interrupt()
+                await sess.interrupt()
                 sess.generate_reply(user_input=text)
                 logger.info(
                     "user_chat_text_reply_started room=%s source=%s",
@@ -1320,7 +1320,7 @@ async def entrypoint(ctx: agents.JobContext):
                 if chatlog_writer is not None:
                     await chatlog_writer.write("user", text)
                 _schedule_user_turn_feedback(text)
-                sess.interrupt()
+                await sess.interrupt()
                 sess.generate_reply(user_input=text)
                 logger.info("user_chat_text_reply_started room=%s source=lk.chat", room_name)
 
