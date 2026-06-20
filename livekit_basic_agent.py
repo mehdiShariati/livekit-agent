@@ -1114,14 +1114,6 @@ async def entrypoint(ctx: agents.JobContext):
                     if len(responded) > 500:
                         transcription_input_bridge["responded_segments"] = set(list(responded)[-250:])
 
-                logger.info(
-                    "user_transcription_text room=%s identity=%s segment=%s text=%r",
-                    room_name,
-                    participant_identity,
-                    segment_id or "none",
-                    text[:180],
-                )
-
                 schedule_feedback = transcription_input_bridge.get("schedule_feedback")
                 if callable(schedule_feedback):
                     schedule_feedback(text)
@@ -1131,8 +1123,21 @@ async def entrypoint(ctx: agents.JobContext):
                     logger.warning("transcription_text_no_session room=%s", room_name)
                     return
 
+                logger.info(
+                    "user_chat_text room=%s source=%s identity=%s segment=%s text=%r",
+                    room_name,
+                    TOPIC_TRANSCRIPTION,
+                    participant_identity,
+                    segment_id or "none",
+                    text[:180],
+                )
                 sess.interrupt()
                 sess.generate_reply(user_input=text)
+                logger.info(
+                    "user_chat_text_reply_started room=%s source=%s",
+                    room_name,
+                    TOPIC_TRANSCRIPTION,
+                )
 
             asyncio.create_task(
                 _handle_transcription_text(),
@@ -1297,17 +1302,43 @@ async def entrypoint(ctx: agents.JobContext):
                     name=f"realtime-feedback-{turn_id[:8]}",
                 )
 
+            async def _on_roomio_chat_text(sess: AgentSession, ev: room_io.TextInputEvent) -> None:
+                text = clean_text(ev.text, "")
+                if not text:
+                    return
+                logger.info(
+                    "roomio_text_input room=%s participant=%s topic=lk.chat",
+                    room_name,
+                    getattr(ev.participant, "identity", "unknown"),
+                )
+                logger.info(
+                    "user_chat_text room=%s source=lk.chat participant=%s text=%r",
+                    room_name,
+                    getattr(ev.participant, "identity", "unknown"),
+                    text[:180],
+                )
+                if chatlog_writer is not None:
+                    await chatlog_writer.write("user", text)
+                _schedule_user_turn_feedback(text)
+                sess.interrupt()
+                sess.generate_reply(user_input=text)
+                logger.info("user_chat_text_reply_started room=%s source=lk.chat", room_name)
+
             await session.start(
                 room=ctx.room,
                 agent=assistant,
                 room_options=room_io.RoomOptions(
-                    text_input=False,
+                    text_input=room_io.TextInputOptions(text_input_cb=_on_roomio_chat_text),
                     text_output=True,
                 ),
             )
             transcription_input_bridge["session"] = session
             transcription_input_bridge["schedule_feedback"] = _schedule_user_turn_feedback
-            logger.info("agent_started room=%s text_input_topic=%s", room_name, TOPIC_TRANSCRIPTION)
+            logger.info(
+                "agent_started room=%s text_input_topics=%s,lk.chat",
+                room_name,
+                TOPIC_TRANSCRIPTION,
+            )
 
             # Fallback source: poll session chat context and persist unseen lines.
             # This avoids hard dependency on specific transcription event names.
