@@ -12,7 +12,7 @@ from typing import Any, Optional
 import asyncpg
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession
+from livekit.agents import Agent, AgentSession, room_io
 from livekit.plugins import openai, silero
 
 load_dotenv(".env")
@@ -604,7 +604,7 @@ class PgRoomLock:
 class ChatLogWriter:
     """
     Best-effort writer for `chat_logs`.
-    Stores user STT + agent spoken text (from transcription events).
+    Stores user speech, typed text, and agent spoken text.
     """
 
     def __init__(self, room_name: str, onboarding_session_id: str = ""):
@@ -1101,12 +1101,6 @@ async def entrypoint(ctx: agents.JobContext):
             )
             assistant = DynamicAssistant(instructions=system_prompt)
 
-            await session.start(
-                room=ctx.room,
-                agent=assistant,
-            )
-            logger.info("agent_started room=%s", room_name)
-
             # Primary chat log source: committed speech events from AgentSession.
             # This captures what was actually said, not generation instructions.
             def _extract_event_text(payload: Any) -> str:
@@ -1168,6 +1162,27 @@ async def entrypoint(ctx: agents.JobContext):
                     ),
                     name=f"realtime-feedback-{turn_id[:8]}",
                 )
+
+            async def _on_user_text_input(sess: AgentSession, ev: room_io.TextInputEvent) -> None:
+                text = clean_text(ev.text, "")
+                if not text:
+                    return
+                logger.info("user_text_input room=%s text=%r", room_name, text[:180])
+                if chatlog_writer is not None:
+                    await chatlog_writer.write("user", text)
+                _schedule_user_turn_feedback(text)
+                sess.interrupt()
+                sess.generate_reply(user_input=text)
+
+            await session.start(
+                room=ctx.room,
+                agent=assistant,
+                room_options=room_io.RoomOptions(
+                    text_input=room_io.TextInputOptions(text_input_cb=_on_user_text_input),
+                    text_output=True,
+                ),
+            )
+            logger.info("agent_started room=%s text_input=enabled", room_name)
 
             # Fallback source: poll session chat context and persist unseen lines.
             # This avoids hard dependency on specific transcription event names.
