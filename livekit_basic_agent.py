@@ -12,7 +12,7 @@ from typing import Any, Optional
 import asyncpg
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from livekit.agents import Agent, AgentSession
+from livekit.agents import Agent, AgentSession, room_io
 from livekit.plugins import openai, silero
 
 load_dotenv(".env")
@@ -604,7 +604,7 @@ class PgRoomLock:
 class ChatLogWriter:
     """
     Best-effort writer for `chat_logs`.
-    Stores user STT + agent spoken text (from transcription events).
+    Stores user speech, typed text, and agent spoken text.
     """
 
     def __init__(self, room_name: str, onboarding_session_id: str = ""):
@@ -613,6 +613,7 @@ class ChatLogWriter:
         self.conn: Optional[asyncpg.Connection] = None
         self._lock = asyncio.Lock()
         self._last_line: Optional[tuple[str, str]] = None
+        self._seen_lines: set[tuple[str, str]] = set()
 
     async def connect(self) -> None:
         if self.conn is not None:
@@ -646,9 +647,9 @@ class ChatLogWriter:
         if len(text) > 4000:
             text = text[:4000]
 
-        # Skip immediate duplicates (common with partial transcript event bursts).
+        # Skip duplicates from transcript bursts and overlapping event sources.
         line_key = (role, text)
-        if self._last_line == line_key:
+        if line_key in self._seen_lines or self._last_line == line_key:
             return
 
         await self.connect()
@@ -743,6 +744,7 @@ class ChatLogWriter:
                     raise last_error or RuntimeError("unknown chatlog insert error")
 
                 self._last_line = line_key
+                self._seen_lines.add(line_key)
             except Exception as e:
                 logger.exception("chatlog_insert_failed room=%s role=%s error=%s", self.room_name, role, e)
 
@@ -1101,37 +1103,6 @@ async def entrypoint(ctx: agents.JobContext):
             )
             assistant = DynamicAssistant(instructions=system_prompt)
 
-            await session.start(
-                room=ctx.room,
-                agent=assistant,
-            )
-            logger.info("agent_started room=%s", room_name)
-
-            # Primary chat log source: committed speech events from AgentSession.
-            # This captures what was actually said, not generation instructions.
-            def _extract_event_text(payload: Any) -> str:
-                if payload is None:
-                    return ""
-                if isinstance(payload, str):
-                    return clean_text(payload, "")
-                for key in ("text", "transcript", "content", "message"):
-                    val = getattr(payload, key, None)
-                    if isinstance(val, str) and val.strip():
-                        return clean_text(val, "")
-                    if isinstance(payload, dict):
-                        dval = payload.get(key)
-                        if isinstance(dval, str) and dval.strip():
-                            return clean_text(dval, "")
-                return ""
-
-            def _queue_chatlog(role: str, payload: Any) -> None:
-                if chatlog_writer is None:
-                    return
-                text = _extract_event_text(payload)
-                if not text:
-                    return
-                asyncio.create_task(chatlog_writer.write(role, text))
-
             realtime_feedback_enabled = realtime_feedback_flag
             last_feedback_text = ""
             last_feedback_at = 0.0
@@ -1168,6 +1139,52 @@ async def entrypoint(ctx: agents.JobContext):
                     ),
                     name=f"realtime-feedback-{turn_id[:8]}",
                 )
+
+            async def _on_user_text_input(sess: AgentSession, ev: room_io.TextInputEvent) -> None:
+                text = clean_text(ev.text, "")
+                if not text:
+                    return
+                logger.info("user_text_input room=%s text=%r", room_name, text[:180])
+                if chatlog_writer is not None:
+                    await chatlog_writer.write("user", text)
+                _schedule_user_turn_feedback(text)
+                sess.interrupt()
+                sess.generate_reply(user_input=text)
+
+            await session.start(
+                room=ctx.room,
+                agent=assistant,
+                room_options=room_io.RoomOptions(
+                    text_input=room_io.TextInputOptions(text_input_cb=_on_user_text_input),
+                    text_output=True,
+                ),
+            )
+            logger.info("agent_started room=%s text_input=enabled", room_name)
+
+            # Primary chat log source: committed speech events from AgentSession.
+            # This captures what was actually said, not generation instructions.
+            def _extract_event_text(payload: Any) -> str:
+                if payload is None:
+                    return ""
+                if isinstance(payload, str):
+                    return clean_text(payload, "")
+                for key in ("text", "transcript", "content", "message"):
+                    val = getattr(payload, key, None)
+                    if isinstance(val, str) and val.strip():
+                        return clean_text(val, "")
+                    if isinstance(payload, dict):
+                        dval = payload.get(key)
+                        if isinstance(dval, str) and dval.strip():
+                            return clean_text(dval, "")
+                return ""
+
+            def _queue_chatlog(role: str, payload: Any) -> None:
+                if chatlog_writer is None:
+                    return
+                text = _extract_event_text(payload)
+                if not text:
+                    return
+                asyncio.create_task(chatlog_writer.write(role, text))
 
             # Fallback source: poll session chat context and persist unseen lines.
             # This avoids hard dependency on specific transcription event names.
