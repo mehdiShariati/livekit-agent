@@ -13,6 +13,12 @@ import asyncpg
 from dotenv import load_dotenv
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession, room_io
+from livekit.agents.types import (
+    ATTRIBUTE_TRANSCRIPTION_FINAL,
+    ATTRIBUTE_TRANSCRIPTION_SEGMENT_ID,
+    ATTRIBUTE_TRANSCRIPTION_TRACK_ID,
+    TOPIC_TRANSCRIPTION,
+)
 from livekit.plugins import openai, silero
 
 load_dotenv(".env")
@@ -604,7 +610,7 @@ class PgRoomLock:
 class ChatLogWriter:
     """
     Best-effort writer for `chat_logs`.
-    Stores user speech, typed text, and agent spoken text.
+    Stores user speech, lk.transcription typed text, and agent spoken text.
     """
 
     def __init__(self, room_name: str, onboarding_session_id: str = ""):
@@ -768,6 +774,21 @@ def count_standard_participants(room: rtc.Room) -> int:
         if _is_standard_kind(getattr(participant, "kind", None)):
             count += 1
     return count
+
+
+def _participant_is_agent(participant: Any, identity: str = "") -> bool:
+    p_identity = clean_text(identity or getattr(participant, "identity", ""), "").lower()
+    p_kind = getattr(participant, "kind", None)
+    return bool(
+        getattr(participant, "is_agent", False)
+        or getattr(participant, "isAgent", False)
+        or p_identity.startswith("agent-")
+        or "agent" in p_identity
+        or (
+            p_kind is not None
+            and int(p_kind) == int(rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
+        )
+    )
 
 
 def has_active_human_audio(room: rtc.Room) -> bool:
@@ -1008,6 +1029,131 @@ async def entrypoint(ctx: agents.JobContext):
         shutdown_reason_ref: Optional[str] = None
         saw_human_disconnect = False
         did_add_shutdown_callback = False
+        transcription_input_bridge: dict[str, Any] = {
+            "session": None,
+            "schedule_feedback": None,
+            "responded_segments": set(),
+            "stored_segments": set(),
+        }
+
+        async def _persist_lk_transcription_user(
+            text: str,
+            *,
+            segment_id: str,
+            track_id: str,
+            is_final: bool,
+        ) -> bool:
+            if not text or chatlog_writer is None:
+                return False
+            # Voice STT mirrors on lk.transcription are only persisted when final.
+            if track_id and not is_final:
+                return False
+            if segment_id:
+                stored: set[str] = transcription_input_bridge["stored_segments"]
+                if segment_id in stored:
+                    return False
+                stored.add(segment_id)
+                if len(stored) > 500:
+                    transcription_input_bridge["stored_segments"] = set(list(stored)[-250:])
+            await chatlog_writer.write("user", text)
+            logger.info(
+                "chatlog_lk_transcription_user room=%s segment=%s voice=%s text=%r",
+                room_name,
+                segment_id or "none",
+                bool(track_id),
+                text[:180],
+            )
+            return True
+
+        def _on_lk_transcription_text(reader: rtc.TextStreamReader, participant_identity: str) -> None:
+            async def _handle_transcription_text() -> None:
+                participant = ctx.room.remote_participants.get(participant_identity)
+                if participant is None:
+                    logger.warning(
+                        "transcription_text_participant_missing room=%s identity=%s",
+                        room_name,
+                        participant_identity,
+                    )
+                    return
+                if not _is_standard_kind(getattr(participant, "kind", None)):
+                    return
+                if _participant_is_agent(participant, participant_identity):
+                    return
+
+                try:
+                    text = clean_text(await reader.read_all(), "")
+                except Exception:
+                    logger.exception("transcription_text_read_failed room=%s", room_name)
+                    return
+
+                attrs = reader.info.attributes or {}
+                track_id = clean_text(attrs.get(ATTRIBUTE_TRANSCRIPTION_TRACK_ID), "")
+                is_final = clean_text(attrs.get(ATTRIBUTE_TRANSCRIPTION_FINAL), "").lower() == "true"
+                segment_id = clean_text(attrs.get(ATTRIBUTE_TRANSCRIPTION_SEGMENT_ID), "")
+
+                if not text:
+                    return
+
+                # Always persist user lk.transcription messages to chat_logs (deduped by segment_id).
+                await _persist_lk_transcription_user(
+                    text,
+                    segment_id=segment_id,
+                    track_id=track_id,
+                    is_final=is_final,
+                )
+
+                # Voice STT is mirrored to lk.transcription for the client UI; audio pipeline handles replies.
+                if track_id:
+                    return
+
+                if segment_id:
+                    responded: set[str] = transcription_input_bridge["responded_segments"]
+                    if segment_id in responded:
+                        return
+                    responded.add(segment_id)
+                    if len(responded) > 500:
+                        transcription_input_bridge["responded_segments"] = set(list(responded)[-250:])
+
+                logger.info(
+                    "user_transcription_text room=%s identity=%s segment=%s text=%r",
+                    room_name,
+                    participant_identity,
+                    segment_id or "none",
+                    text[:180],
+                )
+
+                schedule_feedback = transcription_input_bridge.get("schedule_feedback")
+                if callable(schedule_feedback):
+                    schedule_feedback(text)
+
+                sess = transcription_input_bridge.get("session")
+                if sess is None:
+                    logger.warning("transcription_text_no_session room=%s", room_name)
+                    return
+
+                sess.interrupt()
+                sess.generate_reply(user_input=text)
+
+            asyncio.create_task(
+                _handle_transcription_text(),
+                name=f"lk-transcription-input-{participant_identity[:24]}",
+            )
+
+        register_text_handler = getattr(ctx.room, "register_text_stream_handler", None)
+        if callable(register_text_handler):
+            try:
+                register_text_handler(TOPIC_TRANSCRIPTION, _on_lk_transcription_text)
+                logger.info(
+                    "transcription_text_handler_registered room=%s topic=%s",
+                    room_name,
+                    TOPIC_TRANSCRIPTION,
+                )
+            except ValueError:
+                logger.warning(
+                    "transcription_text_handler_already_set room=%s topic=%s",
+                    room_name,
+                    TOPIC_TRANSCRIPTION,
+                )
 
         room_on = getattr(ctx.room, "on", None)
         if callable(room_on):
@@ -1018,19 +1164,7 @@ async def entrypoint(ctx: agents.JobContext):
                 p = participant
                 if p is None:
                     return
-                p_identity = clean_text(getattr(p, "identity", ""), "").lower()
-                p_kind = getattr(p, "kind", None)
-                is_agent_role = bool(
-                    getattr(p, "is_agent", False)
-                    or getattr(p, "isAgent", False)
-                    or p_identity.startswith("agent-")
-                    or "agent" in p_identity
-                    or (
-                        p_kind is not None
-                        and int(p_kind) == int(rtc.ParticipantKind.PARTICIPANT_KIND_AGENT)
-                    )
-                )
-                role = "assistant" if is_agent_role else "user"
+                role = "assistant" if _participant_is_agent(p) else "user"
                 try:
                     items = transcriptions if isinstance(transcriptions, (list, tuple)) else [transcriptions]
                     for item in items or []:
@@ -1163,26 +1297,17 @@ async def entrypoint(ctx: agents.JobContext):
                     name=f"realtime-feedback-{turn_id[:8]}",
                 )
 
-            async def _on_user_text_input(sess: AgentSession, ev: room_io.TextInputEvent) -> None:
-                text = clean_text(ev.text, "")
-                if not text:
-                    return
-                logger.info("user_text_input room=%s text=%r", room_name, text[:180])
-                if chatlog_writer is not None:
-                    await chatlog_writer.write("user", text)
-                _schedule_user_turn_feedback(text)
-                sess.interrupt()
-                sess.generate_reply(user_input=text)
-
             await session.start(
                 room=ctx.room,
                 agent=assistant,
                 room_options=room_io.RoomOptions(
-                    text_input=room_io.TextInputOptions(text_input_cb=_on_user_text_input),
+                    text_input=False,
                     text_output=True,
                 ),
             )
-            logger.info("agent_started room=%s text_input=enabled", room_name)
+            transcription_input_bridge["session"] = session
+            transcription_input_bridge["schedule_feedback"] = _schedule_user_turn_feedback
+            logger.info("agent_started room=%s text_input_topic=%s", room_name, TOPIC_TRANSCRIPTION)
 
             # Fallback source: poll session chat context and persist unseen lines.
             # This avoids hard dependency on specific transcription event names.
@@ -1406,6 +1531,8 @@ async def entrypoint(ctx: agents.JobContext):
 
             # Cleanup this iteration.
             logger.info("agent_cleanup_start room=%s", room_name)
+            transcription_input_bridge["session"] = None
+            transcription_input_bridge["schedule_feedback"] = None
             with contextlib.suppress(Exception):
                 if runtime is not None:
                     await runtime.stop()
