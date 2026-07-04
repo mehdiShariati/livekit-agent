@@ -1521,7 +1521,7 @@ async def entrypoint(ctx: agents.JobContext):
                     humans = count_standard_participants(ctx.room)
                     has_audio = has_active_human_audio(ctx.room)
                     now = time.monotonic()
-                    if humans > 0 and has_audio:
+                    if humans > 0:
                         last_human_seen_at = now
                     elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
                         logger.info(
