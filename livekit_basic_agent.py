@@ -166,7 +166,7 @@ def static_safety_rules() -> str:
 
 
 def _is_first_coaching_session(config: dict[str, Any]) -> bool:
-    """Funnel V2.5 first coaching session (~75s, goal-based, not a test)."""
+    """Funnel V2.5 first coaching session (~95s, goal-based, not a test)."""
     return clean_text(config.get("assessment_type"), "").lower() == "first_coaching_session"
 
 
@@ -306,7 +306,7 @@ def build_first_coaching_session_system_prompt(config: dict[str, Any]) -> str:
     commitment_hint = _first_coaching_commitment_hint(config)
     visualization_question = _first_coaching_visualization_question(config)
     english_activity = _first_coaching_english_activity(config)
-    max_sec = clean_text(config.get("max_duration_sec"), "75") or "75"
+    max_sec = clean_text(config.get("max_duration_sec"), "95") or "95"
     goal_ref = formatted_goal or raw_goal or goal_category or "their language goal"
 
     language_rules = _first_coaching_language_rules(session_mode, native, target)
@@ -334,31 +334,30 @@ The user already answered goal, details, blocker, and commitment in onboarding �
 
 **Session flow (strict order; under {max_sec}s total):**
 
-**TURN 1 — Safety opening (~20s). NO QUESTION.**
-Follow the separate first-turn instruction. Create safety only:
-greet as Roccon → remove anxiety (not testing English) → explain your coaching role →
-set expectation (you help decide what to study each time) → transition (one minute together to see where to begin).
+**TURN 1 — Safety opening (~18s). NO QUESTION.**
+Follow the separate first-turn instruction. Five brief sentences only:
+greet as Roccon → remove anxiety → coaching role → expectation → transition to one minute together.
 
-**TURN 2 — Understanding (~12s ask + listen)**
+**TURN 2 — Understanding (~14s ask + listen)**
 Ask exactly ONE emotional visualization question — then listen, mirror, affirm. Never interrogate.
 Question: "{visualization_question}"
 
-**TURN 3 — Transition to tiny success (~8s)**
+**TURN 3 — Transition to tiny success (~10s)**
 Affirm naturally what they shared. Then say something like:
 "I understand. Let's try one very small English exercise together."
 
-**TURN 4 — One English activity (~20s max)**
+**TURN 4 — One English activity (~22s max)**
 {english_activity}
 Adapt using internal goal/blocker context. ONE activity only — never a second task.
 
-**TURN 5 — Feedback (~8s)**
+**TURN 5 — Feedback (~10s)**
 Start with "I noticed something." Give exactly ONE strength and ONE opportunity.
 Never scores, grades, CEFR, percentages, or "your English is weak."
 
-**TURN 6 — Emotional payoff (~8s)**
+**TURN 6 — Emotional payoff (~10s)**
 Say something like: "I already know what your first mission should be." or "I know where we'll start."
 
-**TURN 7 — Close (~8s)**
+**TURN 7 — Close (~10s)**
 End warmly: "Great. I have everything I need. Let's build your first personalized plan." Then STOP.
 
 **Language rules (session_mode={session_mode}):**
@@ -409,23 +408,19 @@ def default_first_coaching_opening(config: dict[str, Any]) -> str:
         return (
             "FIRST ASSISTANT TURN (spoken) — SAFETY OPENING ONLY. DO NOT ASK ANY QUESTION: "
             f"Speak entirely in {native or 'the learner native language'}. "
-            "Sound like a calm, trustworthy human coach — someone they want to meet again tomorrow. "
-            f"Include all five parts naturally in one warm flow: {safety_parts} "
-            "Do NOT ask a question. Do NOT mention assessment, demo, placement, score, or readiness. "
-            "Do NOT practice English yet. ~20 seconds, then pause and wait."
+            f"Five parts, one short sentence each: {safety_parts} "
+            "No question. No English yet. ~15-18 seconds spoken, then pause."
         )
     if session_mode == "advanced_target_language":
         return (
             "FIRST ASSISTANT TURN (spoken) — SAFETY OPENING ONLY. DO NOT ASK ANY QUESTION: "
-            f"Speak in {target}. Warm, confident, human — Roccon, their dedicated coach. "
-            f"Include all five parts naturally: {safety_parts} "
-            "Do NOT ask a question. Do NOT assess or evaluate. ~18 seconds, then pause."
+            f"Speak in {target}. Five parts, one short sentence each: {safety_parts} "
+            "No question. ~15 seconds, then pause."
         )
     return (
         "FIRST ASSISTANT TURN (spoken) — SAFETY OPENING ONLY. DO NOT ASK ANY QUESTION: "
-        f"Speak in {native or 'native language'} for emotional safety. "
-        f"Include all five parts naturally: {safety_parts} "
-        "Do NOT ask a question. ~20 seconds, then pause."
+        f"Speak in {native or 'native language'}. Five parts, one short sentence each: {safety_parts} "
+        "No question. ~15-18 seconds, then pause."
     )
 
 
