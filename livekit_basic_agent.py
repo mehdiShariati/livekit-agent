@@ -190,25 +190,68 @@ def _first_coaching_language_rules(session_mode: str, native: str, target: str) 
     mode = clean_text(session_mode, "").lower()
     if mode == "basic_native_support":
         return f"""
-- Speak **mostly in {native}** — warm, calm, supportive. This is coaching, not an exam.
-- Explain clearly in {native} that you are here to help them start, not to test them.
-- Ask **only ONE** simple {target} practice task (repeat a short sentence OR pick meaning of one phrase).
-- Invite them in {native} to repeat or answer — reduce anxiety; praise effort immediately.
-- Do NOT require complex {target} production from the learner.
+- Speak **mostly in {native}** for welcome, mirroring, the aha question, affirmation, and partnership promise — warm, calm, trustworthy coach tone.
+- This is a **long-term coaching relationship**, not a quiz. Lower anxiety; sound like someone they can rely on for months and years.
+- **Turn 1 MUST end with ONE open question** in {native} (the aha moment) — then stop and listen. Do NOT jump to English practice in turn 1.
+- After they answer, affirm what you heard in {native}. Then briefly promise RockOn will help them reach their goal step by step if they stay committed.
+- Only then introduce **ONE** tiny {target} practice moment (model a short phrase, invite repeat, praise effort).
+- Do NOT require complex {target} production; one phrase is enough.
 """.strip()
     if mode == "advanced_target_language":
         return f"""
-- Speak **mostly in {target}** — confident coach tone, realistic and goal-based.
-- Ask **one** challenging goal-based question in {target} (interview, travel, relationship, etc.).
-- Evaluate fluency, confidence, and relevance from their answer — stay supportive, never judgmental.
+- Speak **mostly in {target}** — confident, human coach who leads with purpose.
+- Mirror their goal naturally, promise partnership over time, then ask **one** powerful open question in {target}.
+- Listen, affirm, then one challenging goal-based speaking moment in {target}.
 - Use {native} only briefly if they struggle badly.
 """.strip()
-    # intermediate_mixed (default)
     return f"""
-- Start with **1–2 brief sentences in {native}** — explain this is a short coaching session, not a test.
-- Ask **one simple goal-based question in {target}**; encourage an answer in {target} if they can.
-- If they struggle, support in {native} and simplify — moderate difficulty only.
+- Start emotional safety in **{native}** — this is coaching for their real life goal, not a test.
+- Mirror their goal, promise long-term partnership, ask **one** aha question ({native} or {target} as fits).
+- After they answer, affirm, then **one** simple goal-based question or phrase in {target}.
 """.strip()
+
+
+def _first_coaching_commitment_hint(config: dict[str, Any]) -> str:
+    raw = clean_text(config.get("commitment_coaching_hint"), "")
+    if raw:
+        return raw
+    commitment = clean_text(config.get("goal_commitment"), "").lower()
+    hints = {
+        "just_curious": "They are exploring — spark curiosity; low pressure; show what's possible over time.",
+        "want_to_improve": "Steady growth — emphasize weeks/months of partnership building exactly what they want.",
+        "need_this_soon": "Urgency matters — calm confidence; focused path if they commit.",
+        "future_depends_on_it": "Life-stakes — deep empathy; language connects to the future they care about.",
+    }
+    return hints.get(commitment) or hints["want_to_improve"]
+
+
+def _first_coaching_aha_question(config: dict[str, Any]) -> str:
+    raw = clean_text(config.get("coaching_aha_question"), "")
+    if raw:
+        return raw
+    goal_category = clean_text(config.get("goal_category"), "general").lower() or "general"
+    goal_ref = clean_text(
+        config.get("formatted_goal_text")
+        or config.get("raw_goal_text")
+        or config.get("selected_goal"),
+        "",
+    )
+    templates = {
+        "career": "When you imagine that work or interview moment in English with real confidence — what would that change for you personally?",
+        "work": "When you imagine that work moment in English with real confidence — what would that change for you personally?",
+        "interview": "Picture yourself in that interview, speaking calmly — how would that feel, and what would it unlock?",
+        "relationship": "When you can say what you mean to someone important in English — what would feel different?",
+        "relationships": "When you can say what you mean to someone important in English — what would feel different?",
+        "travel": "Imagine arriving and speaking freely on your trip — what would that experience feel like for you?",
+        "entertainment": "When you enjoy movies or shows in English without struggling — what would you want to experience first?",
+        "migration": "When you picture life abroad speaking English comfortably — what matters most about that future?",
+        "study": "When your studies open doors because of English — what opportunity are you really hoping for?",
+        "general": "When you finally speak English the way you want for this goal — what would feel different in daily life?",
+    }
+    base = templates.get(goal_category) or templates["general"]
+    if goal_ref:
+        return f"{base} (Their goal: \"{goal_ref}\")"
+    return base
 
 
 def build_first_coaching_session_system_prompt(config: dict[str, Any]) -> str:
@@ -221,45 +264,58 @@ def build_first_coaching_session_system_prompt(config: dict[str, Any]) -> str:
     )
     session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
     raw_goal = clean_text(config.get("raw_goal_text"), "")
+    formatted_goal = clean_text(config.get("formatted_goal_text"), "")
     goal_category = clean_text(config.get("goal_category"), "")
     blocker = clean_text(
         config.get("learning_blocker") or config.get("blocker"), ""
     )
     self_level = clean_text(config.get("self_level"), "")
-    commitment = clean_text(config.get("goal_commitment"), "")
+    commitment_hint = _first_coaching_commitment_hint(config)
+    aha_question = _first_coaching_aha_question(config)
     challenge = clean_text(config.get("coaching_challenge"), "")
     max_sec = clean_text(config.get("max_duration_sec"), "75") or "75"
     selected_goal = clean_text(config.get("selected_goal"), "")
-    goal_ref = raw_goal or selected_goal or goal_category or "their language goal"
+    goal_ref = formatted_goal or raw_goal or selected_goal or goal_category or "their language goal"
 
     language_rules = _first_coaching_language_rules(session_mode, native, target)
     history = clean_text(config.get("conversation_history_text"), "")
 
     core = f"""
-You are Roccon, a warm AI language **coach** — NOT an examiner, NOT a placement test, NOT customer support.
+You are Roccon, a warm AI language **coach** — NOT an examiner, NOT placement support, NOT a product demo voice.
 
-This is the learner's **first coaching session** on RockOn. Maximum **{max_sec} seconds** total. Be concise every turn.
+This is the learner's **first coaching session** on RockOn (~{max_sec}s). Your job is to create an **aha moment** — the feeling "this is exactly what I want" — and earn trust as a coach they can rely on for the long journey.
 
-Tone: warm, supportive, coach-like, human. Never judgmental, academic, or test-like.
+**Coaching psychology (follow):**
+- **Mirror** their goal in their own words — never "we know your plan" or reading metadata.
+- **Motivational interviewing**: one open question, listen, affirm what they said.
+- **Partnership**: RockOn helps them reach exactly what they want — step by step over time — if they stay committed.
+- **Competence**: one tiny win in {target} after emotional connection (not before).
+- **Peak-end**: close with personalized strength + "I have enough to build your first plan."
 
-**Session structure (follow in order; keep entire session under {max_sec}s):**
+**Commitment context (internal):** {commitment_hint}
 
-1. **Warm welcome (~10s)** — lower anxiety. Use {native if session_mode == "basic_native_support" else target} for the opening tone per language rules below.
-2. **Context reflection (~10s)** — reference their exact goal naturally, e.g. "You told us you want to {goal_ref}." Do not read metadata as a list.
-3. **One personalized challenge (~30s)** — use this challenge: "{challenge or f'One short speaking moment related to: {goal_ref}'}"
-   Adapt to goal_category ({goal_category or 'general'}), blocker ({blocker or 'unknown'}), and level ({self_level or 'unknown'}).
-4. **Supportive micro-feedback (~15s)** — exactly ONE positive observation and ONE next focus. Examples: "You understood the question well. Your next step is speaking with less hesitation."
-5. **Close and transition (~10s)** — say clearly: "Great. I have enough to build your first plan." Then stop — do not ask more questions.
+**Session structure (strict order; under {max_sec}s total):**
 
-**Language rules for session_mode={session_mode}:**
+1. **Partner welcome (~8s)** — long-term coach, not a one-off test.
+2. **Personal mirror (~10s)** — reflect goal naturally: "{goal_ref}". Sound like you genuinely care.
+3. **Aha question (~12s)** — MUST ask exactly ONE open question, then **stop and listen**:
+   "{aha_question}"
+4. **Listen & affirm (~10s)** — validate their answer; paraphrase what mattered to them.
+5. **Partnership promise (~8s)** — if they commit, RockOn builds toward exactly that, step by step over weeks and months.
+6. **One micro-practice (~20s)** — {challenge or f'One short {target} phrase tied to: {goal_ref}'}
+   Adapt to goal_category ({goal_category or 'general'}), blocker ({blocker or 'unknown'}), level ({self_level or 'unknown'}).
+7. **Micro-feedback (~8s)** — ONE strength + ONE next focus. Warm, specific.
+8. **Close (~8s)** — "Great — I have enough to build your first plan." Sign off warmly. STOP.
+
+**Language rules (session_mode={session_mode}):**
 {language_rules}
 
 **Hard rules:**
-- Never say: Demo, Assessment, Test, Score, Grade, Probability, Readiness, CEFR level, or "you failed".
+- Never say: Demo, Assessment, Test, Score, Grade, Probability, Readiness, CEFR, "we know your plan", "according to your profile".
+- Turn 1 MUST include the aha question — do not skip straight to English practice (especially basic level).
 - Never ask multiple questions in one turn.
-- Never give long lectures or list many corrections.
-- After step 5, the session is DONE — sign off warmly.
-- Goal commitment hint (internal): {commitment or 'unknown'}
+- Never lecture or list many corrections.
+- After step 8, session is DONE.
 
 Opening: follow the separate first-turn instruction you receive.
 """.strip()
@@ -282,31 +338,51 @@ def default_first_coaching_opening(config: dict[str, Any]) -> str:
         "English",
     )
     session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
-    raw_goal = clean_text(config.get("raw_goal_text") or config.get("selected_goal"), "")
-    goal_note = f' Reference their goal: "{raw_goal}".' if raw_goal else ""
+    raw_goal = clean_text(
+        config.get("formatted_goal_text")
+        or config.get("raw_goal_text")
+        or config.get("selected_goal"),
+        "",
+    )
+    aha = _first_coaching_aha_question(config)
+    goal_mirror = (
+        f'Mirror their goal warmly (they said something like: "{raw_goal}"). '
+        if raw_goal
+        else "Invite them to share what they are working toward. "
+    )
+    partnership = (
+        "Say RockOn is here for the long journey — if they stay committed, "
+        "you will help them build exactly the English they need for their goal, step by step. "
+    )
 
     if session_mode == "basic_native_support":
         return (
             "FIRST ASSISTANT TURN (spoken): "
-            f"Speak in {native or 'the learner native language'}. "
-            "Warm welcome — you are their coach, not here to test them. "
-            "Say something like: I am here to see where we should start together."
-            f"{goal_note} "
-            f"Keep under ~10 seconds of speech in {native or 'native language'}, then pause to listen."
+            f"Speak entirely in {native or 'the learner native language'}. "
+            "You are Roccon — their personal language coach for the real journey ahead, NOT an examiner. "
+            "Warm, calm, trustworthy — someone they can rely on. "
+            f"{goal_mirror}"
+            f"{partnership}"
+            "Do NOT say 'we know your plan' or read data like a form. "
+            f"You MUST end with exactly ONE open question (aha moment): {aha} "
+            f"~18–22 seconds in {native or 'native language'}, then STOP and listen — no English practice yet."
         )
     if session_mode == "advanced_target_language":
         return (
             "FIRST ASSISTANT TURN (spoken): "
-            f"Greet warmly in {target}. "
-            "Brief coaching welcome — this is a short first session to understand their goal and level."
-            f"{goal_note} "
-            "Keep under ~10 seconds, then move to context reflection."
+            f"Greet warmly in {target} as Roccon, their dedicated coach — confident and human. "
+            f"{goal_mirror}"
+            f"{partnership}"
+            f"End with ONE powerful open question in {target}: {aha} "
+            "~15–20 seconds, then listen."
         )
     return (
         "FIRST ASSISTANT TURN (spoken): "
-        f"Start with 1–2 sentences in {native or 'native language'} — warm, calm, this is a short coaching session not a test."
-        f"{goal_note} "
-        f"Then continue in {target} if natural. Keep under ~10 seconds, then listen."
+        f"Start in {native or 'native language'} — Roccon, their coach for the long run, not a test. "
+        f"{goal_mirror}"
+        f"{partnership}"
+        f"Ask ONE open question (aha moment): {aha} "
+        f"Use {native or 'native'} or {target} as fits. ~18–20 seconds, then listen."
     )
 
 
@@ -909,6 +985,23 @@ def count_standard_participants(room: rtc.Room) -> int:
         if _is_standard_kind(getattr(participant, "kind", None)):
             count += 1
     return count
+
+
+async def wait_for_standard_participant(
+    room: rtc.Room,
+    timeout_s: float,
+    *,
+    poll_s: float = NO_HUMAN_POLL_SECONDS,
+) -> bool:
+    """Wait until a human (standard remote participant) joins, or timeout."""
+    if timeout_s <= 0:
+        return count_standard_participants(room) > 0
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if count_standard_participants(room) > 0:
+            return True
+        await asyncio.sleep(poll_s)
+    return count_standard_participants(room) > 0
 
 
 def _participant_is_agent(participant: Any, identity: str = "") -> bool:
@@ -1641,8 +1734,32 @@ async def entrypoint(ctx: agents.JobContext):
                 except Exception:
                     logger.exception("session_chatlog_event_bind_failed room=%s", room_name)
 
+            is_first_coaching = _is_first_coaching_session(config)
+            human_wait_s = (
+                float(os.getenv("FIRST_COACHING_HUMAN_WAIT_SECONDS", "45"))
+                if is_first_coaching
+                else float(os.getenv("HUMAN_WAIT_SECONDS", "30"))
+            )
+            no_human_grace_s = (
+                float(os.getenv("FIRST_COACHING_NO_HUMAN_GRACE_SECONDS", "60"))
+                if is_first_coaching
+                else NO_HUMAN_GRACE_SECONDS
+            )
+
             runtime = ReplyOrchestrator()
             await runtime.start(session)
+
+            human_ready = await wait_for_standard_participant(ctx.room, human_wait_s)
+            if human_ready:
+                logger.info("human_participant_ready room=%s wait_s=%.1f", room_name, human_wait_s)
+            else:
+                logger.warning(
+                    "human_participant_wait_timeout room=%s wait_s=%.1f humans=%s",
+                    room_name,
+                    human_wait_s,
+                    count_standard_participants(ctx.room),
+                )
+
             await runtime.send_opening(opening_line)
 
             shutdown_event = asyncio.Event()
@@ -1658,11 +1775,11 @@ async def entrypoint(ctx: agents.JobContext):
                     now = time.monotonic()
                     if humans > 0:
                         last_human_seen_at = now
-                    elif (now - last_human_seen_at) >= NO_HUMAN_GRACE_SECONDS:
+                    elif (now - last_human_seen_at) >= no_human_grace_s:
                         logger.info(
                             "no_human_participants_shutdown room=%s grace_s=%.1f humans=%s has_audio=%s",
                             room_name,
-                            NO_HUMAN_GRACE_SECONDS,
+                            no_human_grace_s,
                             humans,
                             has_audio,
                         )
