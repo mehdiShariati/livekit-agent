@@ -165,11 +165,18 @@ def static_safety_rules() -> str:
 """.strip()
 
 
+def _is_first_coaching_session(config: dict[str, Any]) -> bool:
+    """Funnel V2.5 first coaching session (~75s, goal-based, not a test)."""
+    return clean_text(config.get("assessment_type"), "").lower() == "first_coaching_session"
+
+
 def _is_onboarding_speaking_session(agent_type: str, config: dict[str, Any]) -> bool:
     """
     Short first speaking check in app onboarding (pre-login) or placement-style rooms.
     Must stay aligned with backend assessment_type onboarding/placement.
     """
+    if _is_first_coaching_session(config):
+        return False
     at = clean_text(agent_type, "").lower()
     assess = clean_text(config.get("assessment_type"), "").lower()
     if assess in ("onboarding", "placement"):
@@ -177,6 +184,130 @@ def _is_onboarding_speaking_session(agent_type: str, config: dict[str, Any]) -> 
     if at == "onboarding" and assess == "":
         return True
     return False
+
+
+def _first_coaching_language_rules(session_mode: str, native: str, target: str) -> str:
+    mode = clean_text(session_mode, "").lower()
+    if mode == "basic_native_support":
+        return f"""
+- Speak **mostly in {native}** — warm, calm, supportive. This is coaching, not an exam.
+- Explain clearly in {native} that you are here to help them start, not to test them.
+- Ask **only ONE** simple {target} practice task (repeat a short sentence OR pick meaning of one phrase).
+- Invite them in {native} to repeat or answer — reduce anxiety; praise effort immediately.
+- Do NOT require complex {target} production from the learner.
+""".strip()
+    if mode == "advanced_target_language":
+        return f"""
+- Speak **mostly in {target}** — confident coach tone, realistic and goal-based.
+- Ask **one** challenging goal-based question in {target} (interview, travel, relationship, etc.).
+- Evaluate fluency, confidence, and relevance from their answer — stay supportive, never judgmental.
+- Use {native} only briefly if they struggle badly.
+""".strip()
+    # intermediate_mixed (default)
+    return f"""
+- Start with **1–2 brief sentences in {native}** — explain this is a short coaching session, not a test.
+- Ask **one simple goal-based question in {target}**; encourage an answer in {target} if they can.
+- If they struggle, support in {native} and simplify — moderate difficulty only.
+""".strip()
+
+
+def build_first_coaching_session_system_prompt(config: dict[str, Any]) -> str:
+    native = clean_text(config.get("native_language"), "the learner's native language")
+    target = clean_text(
+        config.get("speaking_language")
+        or config.get("target_language")
+        or config.get("learning_language"),
+        "English",
+    )
+    session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
+    raw_goal = clean_text(config.get("raw_goal_text"), "")
+    goal_category = clean_text(config.get("goal_category"), "")
+    blocker = clean_text(
+        config.get("learning_blocker") or config.get("blocker"), ""
+    )
+    self_level = clean_text(config.get("self_level"), "")
+    commitment = clean_text(config.get("goal_commitment"), "")
+    challenge = clean_text(config.get("coaching_challenge"), "")
+    max_sec = clean_text(config.get("max_duration_sec"), "75") or "75"
+    selected_goal = clean_text(config.get("selected_goal"), "")
+    goal_ref = raw_goal or selected_goal or goal_category or "their language goal"
+
+    language_rules = _first_coaching_language_rules(session_mode, native, target)
+    history = clean_text(config.get("conversation_history_text"), "")
+
+    core = f"""
+You are Roccon, a warm AI language **coach** — NOT an examiner, NOT a placement test, NOT customer support.
+
+This is the learner's **first coaching session** on RockOn. Maximum **{max_sec} seconds** total. Be concise every turn.
+
+Tone: warm, supportive, coach-like, human. Never judgmental, academic, or test-like.
+
+**Session structure (follow in order; keep entire session under {max_sec}s):**
+
+1. **Warm welcome (~10s)** — lower anxiety. Use {native if session_mode == "basic_native_support" else target} for the opening tone per language rules below.
+2. **Context reflection (~10s)** — reference their exact goal naturally, e.g. "You told us you want to {goal_ref}." Do not read metadata as a list.
+3. **One personalized challenge (~30s)** — use this challenge: "{challenge or f'One short speaking moment related to: {goal_ref}'}"
+   Adapt to goal_category ({goal_category or 'general'}), blocker ({blocker or 'unknown'}), and level ({self_level or 'unknown'}).
+4. **Supportive micro-feedback (~15s)** — exactly ONE positive observation and ONE next focus. Examples: "You understood the question well. Your next step is speaking with less hesitation."
+5. **Close and transition (~10s)** — say clearly: "Great. I have enough to build your first plan." Then stop — do not ask more questions.
+
+**Language rules for session_mode={session_mode}:**
+{language_rules}
+
+**Hard rules:**
+- Never say: Demo, Assessment, Test, Score, Grade, Probability, Readiness, CEFR level, or "you failed".
+- Never ask multiple questions in one turn.
+- Never give long lectures or list many corrections.
+- After step 5, the session is DONE — sign off warmly.
+- Goal commitment hint (internal): {commitment or 'unknown'}
+
+Opening: follow the separate first-turn instruction you receive.
+""".strip()
+
+    history_block = (
+        f"\n\nPrevious conversation history (context only; do not read verbatim):\n{history}"
+        if history
+        else ""
+    )
+    return f"{core}{history_block}"
+
+
+def default_first_coaching_opening(config: dict[str, Any]) -> str:
+    """First-turn spoken instruction when backend did not send opening_line."""
+    native = clean_text(config.get("native_language"), "")
+    target = clean_text(
+        config.get("speaking_language")
+        or config.get("target_language")
+        or config.get("learning_language"),
+        "English",
+    )
+    session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
+    raw_goal = clean_text(config.get("raw_goal_text") or config.get("selected_goal"), "")
+    goal_note = f' Reference their goal: "{raw_goal}".' if raw_goal else ""
+
+    if session_mode == "basic_native_support":
+        return (
+            "FIRST ASSISTANT TURN (spoken): "
+            f"Speak in {native or 'the learner native language'}. "
+            "Warm welcome — you are their coach, not here to test them. "
+            "Say something like: I am here to see where we should start together."
+            f"{goal_note} "
+            f"Keep under ~10 seconds of speech in {native or 'native language'}, then pause to listen."
+        )
+    if session_mode == "advanced_target_language":
+        return (
+            "FIRST ASSISTANT TURN (spoken): "
+            f"Greet warmly in {target}. "
+            "Brief coaching welcome — this is a short first session to understand their goal and level."
+            f"{goal_note} "
+            "Keep under ~10 seconds, then move to context reflection."
+        )
+    return (
+        "FIRST ASSISTANT TURN (spoken): "
+        f"Start with 1–2 sentences in {native or 'native language'} — warm, calm, this is a short coaching session not a test."
+        f"{goal_note} "
+        f"Then continue in {target} if natural. Keep under ~10 seconds, then listen."
+    )
 
 
 def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
@@ -285,6 +416,8 @@ def resolve_opening_line(agent_type: str, config: dict[str, Any]) -> str:
     raw = clean_text(config.get("opening_line"), "")
     if raw:
         return raw
+    if _is_first_coaching_session(config):
+        return default_first_coaching_opening(config)
     if _is_onboarding_speaking_session(agent_type, config):
         return default_onboarding_speaking_opening(config)
     native = clean_text(config.get("native_language"), "English")
@@ -296,7 +429,7 @@ def resolve_opening_line(agent_type: str, config: dict[str, Any]) -> str:
 
 
 def pick_voice(agent_type: str, config: dict[str, Any]) -> str:
-    if _is_onboarding_speaking_session(agent_type, config):
+    if _is_first_coaching_session(config) or _is_onboarding_speaking_session(agent_type, config):
         voices = VOICE_MAP.get("onboarding_assessment") or VOICE_MAP["assessment"]
     else:
         voices = VOICE_MAP.get(agent_type) or VOICE_MAP[DEFAULT_AGENT_TYPE]
@@ -304,6 +437,8 @@ def pick_voice(agent_type: str, config: dict[str, Any]) -> str:
 
 
 def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
+    if _is_first_coaching_session(config):
+        return build_first_coaching_session_system_prompt(config)
     if _is_onboarding_speaking_session(agent_type, config):
         return build_onboarding_speaking_system_prompt(config)
 
