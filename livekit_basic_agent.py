@@ -556,6 +556,16 @@ def build_system_prompt(agent_type: str, config: dict[str, Any]) -> str:
     if _is_onboarding_speaking_session(agent_type, config):
         return build_onboarding_speaking_system_prompt(config)
 
+    coach_mission_extra = ""
+    if clean_text(config.get("assessment_type"), "").lower() == "coach_daily_mission":
+        coach_mission_extra = """
+Coach mission role-play rules (critical):
+- Stay inside the scenario for the entire session — never drop it after the first exchange.
+- Every turn: briefly acknowledge what the learner just said, then ask exactly ONE adaptive follow-up tied to their answer and the scenario topic.
+- Keep the role-play character consistent; thread their previous answers into your next question.
+- Speak in the speaking/target language. Do NOT open with a native-language greeting (no Salam, etc.) unless the learner is stuck.
+""".strip()
+
     native_language = clean_text(config.get("native_language"), "English")
     target_language = clean_text(
         config.get("target_language") or config.get("learning_language"),
@@ -630,6 +640,8 @@ Resume behavior:
 
 Conversation history context:
 {history_text or "No prior room history provided."}
+
+{coach_mission_extra}
 
 Safety and operating rules:
 {static_safety_rules()}
