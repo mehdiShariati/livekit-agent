@@ -75,6 +75,82 @@ def normalize_level(level: str, *, default: str = "A1") -> str:
     return default
 
 
+# Common BCP-47 / ISO codes → display names for LLM prompts.
+_LANGUAGE_DISPLAY_NAMES: dict[str, str] = {
+    "en": "English",
+    "en-us": "English",
+    "en-gb": "English",
+    "de": "German",
+    "de-de": "German",
+    "de-at": "German",
+    "fa": "Persian",
+    "fa-ir": "Persian",
+    "es": "Spanish",
+    "es-es": "Spanish",
+    "es-mx": "Spanish",
+    "fr": "French",
+    "fr-fr": "French",
+    "tr": "Turkish",
+    "tr-tr": "Turkish",
+    "ar": "Arabic",
+    "pt": "Portuguese",
+    "pt-br": "Portuguese",
+    "it": "Italian",
+    "ru": "Russian",
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "hi": "Hindi",
+    "sv": "Swedish",
+    "uk": "Ukrainian",
+}
+
+
+def language_display_name(value: Any, *, default: str = "English") -> str:
+    """Normalize backend language codes/names into a stable prompt label."""
+    cleaned = clean_text(value, "")
+    if not cleaned:
+        return default
+    key = cleaned.lower().replace("_", "-")
+    if key in _LANGUAGE_DISPLAY_NAMES:
+        return _LANGUAGE_DISPLAY_NAMES[key]
+    base = key.split("-", 1)[0]
+    if base in _LANGUAGE_DISPLAY_NAMES:
+        return _LANGUAGE_DISPLAY_NAMES[base]
+    # Already a display name (e.g. "German") — keep as-is.
+    return cleaned
+
+
+def resolve_native_language(config: dict[str, Any], *, default: str = "English") -> str:
+    """Native language from backend config (all conversation types)."""
+    return language_display_name(
+        config.get("native_language")
+        or config.get("native_language_name")
+        or config.get("native_language_code"),
+        default=default,
+    )
+
+
+def resolve_learning_language(config: dict[str, Any], *, default: str = "English") -> str:
+    """
+    Learning / target / speaking language from backend config.
+    Prefer learning_language (canonical field the backend sends for every session).
+    """
+    return language_display_name(
+        config.get("learning_language")
+        or config.get("speaking_language")
+        or config.get("target_language")
+        or config.get("study_language")
+        or config.get("study_language_code")
+        or config.get("learning_language_code")
+        or config.get("learning_language_name"),
+        default=default,
+    )
+
+
 def language_policy(native_language: str, target_language: str, learner_level: str) -> str:
     learner_level = normalize_level(learner_level)
 
@@ -193,9 +269,9 @@ def _first_coaching_language_rules(session_mode: str, native: str, target: str) 
 - Conversation is **almost entirely in {native}** — warm, calm, human coach tone.
 - The user should **never feel tested**. This builds trust, not data collection.
 - **Turn 1 (safety opening):** {native} only — greeting, remove anxiety, explain role, set expectation, transition. **NO question.**
-- **Turn 2+:** {native} for visualization question, listening, affirming, transition to English.
+- **Turn 2+:** {native} for visualization question, listening, affirming, transition to {target}.
 - **Only ONE tiny {target} moment** in the whole session (~20s max): repeat a sentence, say their name, or one very easy question.
-- Explain the English activity in {native}; model the phrase slowly; praise effort immediately.
+- Explain the {target} activity in {native}; model the phrase slowly; praise effort immediately.
 """.strip()
     if mode == "advanced_target_language":
         return f"""
@@ -203,14 +279,14 @@ def _first_coaching_language_rules(session_mode: str, native: str, target: str) 
 - Use {native} **only** if the user becomes completely stuck.
 - **Turn 1:** safety opening in {target} — NO question.
 - **Turn 2:** one visualization question in {target}; listen, mirror, affirm — never interrogate.
-- **One realistic English speaking moment** (~20s max) after emotional connection.
+- **One realistic {target} speaking moment** (~20s max) after emotional connection.
 """.strip()
     return f"""
 - Start in **{native}** for safety; gradually shift to **{target}**.
 - Target mix: roughly **60% {native}**, **40% {target}** across the session.
 - **Turn 1:** safety opening in {native} — NO question.
 - **Turn 2:** visualization question — prefer {native} for emotional safety, or {target} if natural.
-- Support in {native} if they struggle; **one short English answer** for the activity (~20s max).
+- Support in {native} if they struggle; **one short {target} answer** for the activity (~20s max).
 """.strip()
 
 
@@ -234,14 +310,18 @@ def _first_coaching_visualization_question(config: dict[str, Any]) -> str:
     )
     if raw:
         return raw
+    target = resolve_learning_language(config)
     goal_category = clean_text(config.get("goal_category"), "general").lower() or "general"
     templates = {
         "interview": "Imagine your interview goes perfectly. What would that feel like?",
         "career": "Imagine your interview goes perfectly. What would that feel like?",
-        "work": "Imagine a key moment at work goes perfectly in English. What would that feel like?",
+        "work": (
+            f"Imagine a key moment at work goes perfectly in {target}. "
+            "What would that feel like?"
+        ),
         "travel": (
             "Imagine you're arriving at your destination tomorrow. "
-            "What's the first thing you'd like to do in English?"
+            f"What's the first thing you'd like to do in {target}?"
         ),
         "relationship": (
             "Imagine you're meeting someone important to you — maybe family of someone you care about. "
@@ -254,47 +334,43 @@ def _first_coaching_visualization_question(config: dict[str, Any]) -> str:
         "entertainment": "If you could understand one movie without subtitles, which would it be?",
         "migration": "Imagine your first day abroad. What would make you feel confident?",
         "study": (
-            "Imagine you understand a lecture or conversation in English perfectly. "
+            f"Imagine you understand a lecture or conversation in {target} perfectly. "
             "What would that open up for you?"
         ),
         "general": (
-            "Imagine you speak English exactly the way you want for your goal. "
+            f"Imagine you speak {target} exactly the way you want for your goal. "
             "What would feel different in your life?"
         ),
     }
     return templates.get(goal_category) or templates["general"]
 
 
-def _first_coaching_english_activity(config: dict[str, Any]) -> str:
+def _first_coaching_target_activity(config: dict[str, Any]) -> str:
     raw = clean_text(config.get("english_activity") or config.get("coaching_challenge"), "")
     if raw:
         return raw
+    target = resolve_learning_language(config)
     session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
     goal_category = clean_text(config.get("goal_category"), "general").lower() or "general"
     if session_mode == "basic_native_support":
         return (
-            "One tiny English moment only: invite them to repeat one short phrase after you model it, "
-            "say their name in English, or answer one very easy English question. Max ~20 seconds."
+            f"One tiny {target} moment only: invite them to repeat one short phrase after you model it, "
+            f"say their name in {target}, or answer one very easy {target} question. Max ~20 seconds."
         )
     if session_mode == "advanced_target_language":
         return (
-            f"One realistic speaking question in English related to {goal_category}. "
+            f"One realistic speaking question in {target} related to {goal_category}. "
             "Max ~20 seconds."
         )
     return (
-        f"One short English answer related to {goal_category}. "
+        f"One short {target} answer related to {goal_category}. "
         "Brief setup in native language if needed. Max ~20 seconds."
     )
 
 
 def build_first_coaching_session_system_prompt(config: dict[str, Any]) -> str:
-    native = clean_text(config.get("native_language"), "the learner's native language")
-    target = clean_text(
-        config.get("speaking_language")
-        or config.get("target_language")
-        or config.get("learning_language"),
-        "English",
-    )
+    native = resolve_native_language(config, default="the learner's native language")
+    target = resolve_learning_language(config)
     session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
     raw_goal = clean_text(config.get("raw_goal_text"), "")
     formatted_goal = clean_text(config.get("formatted_goal_text"), "")
@@ -305,7 +381,7 @@ def build_first_coaching_session_system_prompt(config: dict[str, Any]) -> str:
     self_level = clean_text(config.get("self_level"), "")
     commitment_hint = _first_coaching_commitment_hint(config)
     visualization_question = _first_coaching_visualization_question(config)
-    english_activity = _first_coaching_english_activity(config)
+    target_activity = _first_coaching_target_activity(config)
     max_sec = clean_text(config.get("max_duration_sec"), "95") or "95"
     goal_ref = formatted_goal or raw_goal or goal_category or "their language goal"
 
@@ -330,6 +406,8 @@ Maximum session length: **{max_sec} seconds**.
 - Blocker: {blocker or 'unknown'}
 - Level: {self_level or 'unknown'}
 - Commitment: {commitment_hint}
+- Learning language (from backend): {target}
+- Native language (from backend): {native}
 The user already answered goal, details, blocker, and commitment in onboarding — **do NOT ask those again**.
 
 **Session flow (strict order; under {max_sec}s total):**
@@ -344,15 +422,15 @@ Question: "{visualization_question}"
 
 **TURN 3 — Transition to tiny success (~10s)**
 Affirm naturally what they shared. Then say something like:
-"I understand. Let's try one very small English exercise together."
+"I understand. Let's try one very small {target} exercise together."
 
-**TURN 4 — One English activity (~22s max)**
-{english_activity}
+**TURN 4 — One {target} activity (~22s max)**
+{target_activity}
 Adapt using internal goal/blocker context. ONE activity only — never a second task.
 
 **TURN 5 — Feedback (~10s)**
 Start with "I noticed something." Give exactly ONE strength and ONE opportunity.
-Never scores, grades, CEFR, percentages, or "your English is weak."
+Never scores, grades, CEFR, percentages, or "your {target} is weak."
 
 **TURN 6 — Emotional payoff (~10s)**
 Say something like: "I already know what your first mission should be." or "I know where we'll start."
@@ -365,7 +443,7 @@ End warmly: "Great. I have everything I need. Let's build your first personalize
 
 **Forbidden words/phrases:**
 Assessment, Placement test, Demo, Test, Score, Grade, Readiness, Probability, CEFR,
-"your level is", "your English is weak", "we know your plan", "according to your profile".
+"your level is", "your {target} is weak", "we know your plan", "according to your profile".
 
 **Hard rules:**
 - Turn 1 must NOT contain any question.
@@ -387,18 +465,13 @@ Opening: follow the separate first-turn instruction you receive.
 
 def default_first_coaching_opening(config: dict[str, Any]) -> str:
     """Turn 1 only: safety opening — NO questions."""
-    native = clean_text(config.get("native_language"), "")
-    target = clean_text(
-        config.get("speaking_language")
-        or config.get("target_language")
-        or config.get("learning_language"),
-        "English",
-    )
+    native = resolve_native_language(config, default="")
+    target = resolve_learning_language(config)
     session_mode = clean_text(config.get("session_mode"), "intermediate_mixed")
 
     safety_parts = (
         "(1) Warm greeting — introduce yourself as Roccon. "
-        "(2) Remove anxiety — you are NOT here to test their English, NOT assessing, NOT evaluating. "
+        f"(2) Remove anxiety — you are NOT here to test their {target}, NOT assessing, NOT evaluating. "
         "(3) Explain your role — your job is to guide them step by step until they reach their goal. "
         "(4) Set expectation — they don't have to know what to study; you help them decide every time you meet. "
         "(5) Transition — let's spend about one minute together so you can understand where to begin."
@@ -409,7 +482,7 @@ def default_first_coaching_opening(config: dict[str, Any]) -> str:
             "FIRST ASSISTANT TURN (spoken) — SAFETY OPENING ONLY. DO NOT ASK ANY QUESTION: "
             f"Speak entirely in {native or 'the learner native language'}. "
             f"Five parts, one short sentence each: {safety_parts} "
-            "No question. No English yet. ~15-18 seconds spoken, then pause."
+            f"No question. No {target} yet. ~15-18 seconds spoken, then pause."
         )
     if session_mode == "advanced_target_language":
         return (
@@ -425,13 +498,8 @@ def default_first_coaching_opening(config: dict[str, Any]) -> str:
 
 
 def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
-    native = clean_text(config.get("native_language"), "the learner's native language")
-    target = clean_text(
-        config.get("speaking_language")
-        or config.get("target_language")
-        or config.get("learning_language"),
-        "English",
-    )
+    native = resolve_native_language(config, default="the learner's native language")
+    target = resolve_learning_language(config)
     level = normalize_level(
         clean_text(config.get("learner_level") or config.get("user_level"), ""),
         default="ADAPTIVE",
@@ -444,11 +512,12 @@ def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
     lines = [
         "## Learner context (internal — do not read as a bullet list to the user)",
         f"- Native language (brief support only): {native}",
-        f"- Language they should practice speaking: {target}",
+        f"- Learning language they should practice speaking (from backend): {target}",
         f"- Level hint: {level} (internal — infer from their speech; never repeat a CEFR label except once at closing)",
     ]
     if name:
         lines.append(f"- Name (use naturally if it fits): {name}")
+        lines.append("- Do NOT ask for their name — you already know it.")
     if goal:
         lines.append(f"- Stated motivation / goal: {goal}")
     if focus:
@@ -459,13 +528,8 @@ def _onboarding_dynamic_context(config: dict[str, Any]) -> str:
 
 
 def build_onboarding_speaking_system_prompt(config: dict[str, Any]) -> str:
-    native = clean_text(config.get("native_language"), "the learner's native language")
-    target = clean_text(
-        config.get("speaking_language")
-        or config.get("target_language")
-        or config.get("learning_language"),
-        "English",
-    )
+    native = resolve_native_language(config, default="the learner's native language")
+    target = resolve_learning_language(config)
     dynamic = _onboarding_dynamic_context(config)
     history = clean_text(config.get("conversation_history_text"), "")
 
@@ -485,7 +549,7 @@ Session rules:
   3) **Once only** — a rough level estimate in plain words from what they actually said (e.g. around A2, between A2 and B1). Do NOT default to A1 unless they only used isolated words.
   4) One short motivating line about steady practice — conversational, not a sales pitch and no app name.
   5) A clear sign-off so they know the check is done (e.g. that's your quick check — nice work).
-- Do **not** say: "How can I help you?", "Welcome to the platform", "Ready to test your English?", or similar.
+- Do **not** say: "How can I help you?", "Welcome to the platform", "Ready to test your {target}?", or similar.
 - Do **not** repeat "you are A1" (or any CEFR label) during the conversation — only at closing if earned by their speech.
 - Do **not** list many corrections, give long paragraphs, or mention internal scores or rubrics.
 - After each learner answer, react to **their content** (topic, vocabulary, clarity) before the next prompt.
@@ -505,13 +569,8 @@ Opening: follow the separate first-turn instruction you receive — it defines e
 
 def default_onboarding_speaking_opening(config: dict[str, Any]) -> str:
     """First-turn spoken instruction when backend did not send opening_line."""
-    native = clean_text(config.get("native_language"), "")
-    target = clean_text(
-        config.get("speaking_language")
-        or config.get("target_language")
-        or config.get("learning_language"),
-        "English",
-    )
+    native = resolve_native_language(config, default="")
+    target = resolve_learning_language(config)
     native_clause = (
         f"You may use one short sentence in {native} for warmth, then switch entirely to {target}. "
         if native
@@ -534,8 +593,8 @@ def resolve_opening_line(agent_type: str, config: dict[str, Any]) -> str:
         return default_first_coaching_opening(config)
     if _is_onboarding_speaking_session(agent_type, config):
         return default_onboarding_speaking_opening(config)
-    native = clean_text(config.get("native_language"), "English")
-    target = clean_text(config.get("target_language") or config.get("learning_language"), "English")
+    native = resolve_native_language(config)
+    target = resolve_learning_language(config)
     return (
         f"First assistant message only: greet warmly in {native}. "
         f"Then continue in {target}. Keep it short and friendly."
@@ -566,12 +625,12 @@ Coach mission role-play rules (critical):
 - Speak in the speaking/target language. Do NOT open with a native-language greeting (no Salam, etc.) unless the learner is stuck.
 """.strip()
 
-    native_language = clean_text(config.get("native_language"), "English")
-    target_language = clean_text(
-        config.get("target_language") or config.get("learning_language"),
-        "English",
+    native_language = resolve_native_language(config)
+    target_language = resolve_learning_language(config)
+    speaking_language = language_display_name(
+        config.get("speaking_language") or target_language,
+        default=target_language,
     )
-    speaking_language = clean_text(config.get("speaking_language"), target_language or "English")
     assessment_type = clean_text(config.get("assessment_type"), "")
     raw_level = clean_text(config.get("learner_level") or config.get("user_level"), "")
     is_onboarding = _is_onboarding_speaking_session(agent_type, config)
@@ -602,6 +661,7 @@ Teach naturally in real-time spoken conversation.
 
 Learner profile:
 - Native language: {native_language}
+- Learning language (from backend): {target_language}
 - Target language: {target_language}
 - Speaking language in this session: {speaking_language}
 - Level: {learner_level}
@@ -1281,11 +1341,16 @@ async def entrypoint(ctx: agents.JobContext):
         voice = pick_voice(agent_type, config)
         short_onboarding = _is_onboarding_speaking_session(agent_type, config)
         realtime_feedback_flag = config.get("realtime_speaking_feedback", True) is not False
+        learning_language = resolve_learning_language(config)
+        native_language = resolve_native_language(config)
         logger.info(
-            "agent_entry room=%s agent_type=%s voice=%s onboarding_speaking=%s realtime_feedback=%s",
+            "agent_entry room=%s agent_type=%s voice=%s learning_language=%s native_language=%s "
+            "onboarding_speaking=%s realtime_feedback=%s",
             room_name,
             agent_type,
             voice,
+            learning_language,
+            native_language,
             short_onboarding,
             realtime_feedback_flag,
         )

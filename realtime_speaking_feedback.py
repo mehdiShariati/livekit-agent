@@ -131,11 +131,13 @@ async def _call_eval_llm(
     config: dict[str, Any],
     max_concurrent: int,
 ) -> dict[str, Any]:
-    native = str(config.get("native_language") or "English")[:64]
+    native = str(config.get("native_language") or config.get("native_language_name") or "English")[:64]
     speaking = str(
-        config.get("speaking_language")
-        or config.get("learning_language")
+        config.get("learning_language")
+        or config.get("speaking_language")
         or config.get("target_language")
+        or config.get("study_language")
+        or config.get("study_language_code")
         or "English"
     )[:64]
     level = str(config.get("learner_level") or config.get("user_level") or "ADAPTIVE")[:12]
